@@ -102,7 +102,7 @@ def generate_signals_simple(config):
             'predicted_1d_return': float(predicted_1d),
             'predictability_index': float(predictability),
             'is_predictable': predictability > 0.6,
-            'koopman_regime': regime,
+            'koopman_regime': regime,  # KEY: use 'koopman_regime' not 'regime'
             'momentum': float(momentum),
             'volatility': float(volatility)
         })
@@ -135,7 +135,7 @@ def generate_signals_simple(config):
             'predicted_1d_return_bps': round(primary['predicted_1d_return'], 1),
             'predicted_1d_return_pct': round(primary['predicted_1d_return'] / 100, 3),
             'predictability_index': round(primary['predictability_index'], 3),
-            'regime': primary['koopman_regime'],
+            'regime': primary['koopman_regime'],  # FIXED: use 'koopman_regime'
             'conviction_derived': round(primary['predictability_index'] * 100, 1)
         },
         'runner_up_picks': [
@@ -145,16 +145,16 @@ def generate_signals_simple(config):
                 'predicted_1d_return_bps': round(r['predicted_1d_return'], 1),
                 'predicted_1d_return_pct': round(r['predicted_1d_return'] / 100, 3),
                 'predictability_index': round(r['predictability_index'], 3),
-                'regime': r['koopman_regime']
+                'regime': r['koopman_regime']  # FIXED: use 'koopman_regime'
             }
             for i, r in enumerate(runners)
         ],
         'koopman_modes': {
-            'regime': primary['koopman_regime'],
+            'regime': primary['koopman_regime'],  # FIXED: use 'koopman_regime'
             'predictability_index': round(primary['predictability_index'], 3),
-            'growth_modes': 2 if primary['regime'] == 'expansion' else 0,
-            'oscillatory_modes': 3 if primary['regime'] == 'oscillatory' else 1,
-            'decay_modes': 60 if primary['regime'] == 'contraction' else 61
+            'growth_modes': 2 if primary['koopman_regime'] == 'expansion' else 0,
+            'oscillatory_modes': 3 if primary['koopman_regime'] == 'oscillatory' else 1,
+            'decay_modes': 60 if primary['koopman_regime'] == 'contraction' else 61
         },
         'all_etfs': signals_sorted,
         'metadata': {
