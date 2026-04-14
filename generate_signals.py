@@ -2,6 +2,7 @@
 Daily signal generation for Koopman-Spectral engine.
 Outputs: ETF pick + Koopman modes + predictability index
 Uses HF dataset: P2SAMAPA/p2-etf-deepm-data/data/master.parquet
+Uploads to: P2SAMAPA/p2-etf-koopman-spectral-results
 """
 
 import torch
@@ -14,6 +15,7 @@ from pathlib import Path
 
 from data_loader import load_config, HFDataLoader, NYSECalendar
 from koopman_model import KoopmanSpectral
+from hf_results_uploader import upload_signals, get_hf_token, ensure_repo_exists
 
 
 def load_model(config, checkpoint_path='koopman_spectral_best.pt'):
@@ -116,10 +118,9 @@ def generate_daily_signals(date_str, model, device, config):
         
         # Get data
         window_data = window[existing_cols].dropna()
-        if len(window_data) < lookback * 0.9:  # 90% coverage required
+        if len(window_data) < lookback * 0.9:
             continue
         
-        # Pad if needed
         if len(window_data) < lookback:
             continue
         
@@ -176,6 +177,7 @@ def generate_daily_signals(date_str, model, device, config):
             NYSECalendar.get_next_trading_date(datetime.strptime(date_str, '%Y-%m-%d'))),
         'objective': 'MAXIMUM PREDICTED RETURN',
         'data_source': 'HF: P2SAMAPA/p2-etf-deepm-data/data/master.parquet',
+        'results_repo': 'HF: P2SAMAPA/p2-etf-koopman-spectral-results',
         'primary_pick': {
             'etf': primary['etf'],
             'rank': 1,
@@ -219,7 +221,7 @@ def main():
         model, device = load_model(config)
         signals = generate_daily_signals(today, model, device, config)
         
-        # Save
+        # Save locally first
         output_dir = Path(config['signals']['output_dir'])
         output_dir.mkdir(exist_ok=True)
         
@@ -227,8 +229,20 @@ def main():
         with open(output_file, 'w') as f:
             json.dump(signals, f, indent=2)
         
-        print(f"Signals saved to {output_file}")
-        print(f"Primary pick: {signals['primary_pick']['etf']} "
+        print(f"Signals saved locally to {output_file}")
+        
+        # Upload to HF Hub
+        try:
+            token = get_hf_token()
+            ensure_repo_exists(token)
+            url = upload_signals(signals, token)
+            print(f"Signals uploaded to HF: {url}")
+            signals['hf_url'] = url
+        except Exception as e:
+            print(f"HF upload failed (token may not be set): {e}")
+            print("Signals available locally only")
+        
+        print(f"\nPrimary pick: {signals['primary_pick']['etf']} "
               f"({signals['primary_pick']['conviction_derived']}% conviction)")
         print(f"Predicted return: {signals['primary_pick']['predicted_1d_return_bps']:.1f} bps")
         print(f"Koopman regime: {signals['koopman_modes']['regime']}")
