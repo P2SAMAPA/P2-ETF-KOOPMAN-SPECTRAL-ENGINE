@@ -1,0 +1,37 @@
+# P2 ETF Koopman-Spectral Engine Configuration
+# Research only · Not financial advice
+
+data:
+  source: "p2-etf-deepm-data"  # Shared data hub
+  etf_universe: ["SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLRE", "XLB", 
+                 "XLP", "XLU", "GDX", "XME", "IWM", "TLT", "LQD", "HYG", 
+                 "VNQ", "GLD", "SLV", "VCIT"]
+  macro_features: ["VIX", "T10Y2Y", "DXY", "HY_IG_spread", "WTI", "DTB3"]
+  train_start: "2008-01-01"
+  train_end: "2025-12-31"
+  val_days: 252  # 1 year validation for conformal calibration
+  lookback_window: 63  # 3 months of daily data per sample
+  
+model:
+  observable_dim: 64        # Koopman observables (K)
+  encoder_hidden: [128, 128] # MLP encoder layers
+  encoder_activation: "relu"
+  linearity_weight: 1.0     # Loss weight for linearity constraint
+  prediction_weight: 1.0    # Loss weight for prediction MSE
+  spectral_weight: 0.1      # Loss weight for spectral penalty
+  
+training:
+  epochs: 500
+  batch_size: 32
+  learning_rate: 0.001
+  patience: 20              # Early stopping
+  dmd_init: true            # Initialize with Dynamic Mode Decomposition
+  
+signals:
+  output_dir: "signals"
+  modes_to_track: 5         # Top K modes to report (growth, oscillatory, decay)
+  predictability_threshold: 0.7  # Spectral gap ratio for "predictable" flag
+
+github_actions:
+  max_runtime_minutes: 300  # 5 hour safety margin
+  cache_data: true
