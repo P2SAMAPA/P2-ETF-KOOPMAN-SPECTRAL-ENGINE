@@ -29,17 +29,6 @@ jobs:
         pip install --upgrade pip
         pip install -r requirements.txt
     
-    - name: Check HF_TOKEN
-      run: |
-        if [ -z "${{ secrets.HF_TOKEN }}" ]; then
-          echo "⚠️ WARNING: secrets.HF_TOKEN not set"
-          echo "Please add HF_TOKEN at: https://github.com/${{ github.repository }}/settings/secrets/actions"
-        else
-          echo "✓ secrets.HF_TOKEN is configured"
-          # Mask the token for security
-          echo "::add-mask::${{ secrets.HF_TOKEN }}"
-        fi
-    
     - name: Download training data from HF
       run: |
         mkdir -p data/p2-etf-deepm-data
@@ -53,17 +42,6 @@ jobs:
         print(f'Downloaded: {len(r.content)} bytes')
         EOF
     
-    - name: Verify data
-      run: |
-        ls -lh data/p2-etf-deepm-data/
-        python << 'EOF'
-        import pandas as pd
-        df = pd.read_parquet('data/p2-etf-deepm-data/master.parquet')
-        print(f'Rows: {len(df)}')
-        print(f'Columns: {list(df.columns)[:10]}...')
-        print(f'ETFs detected: {len([c for c in df.columns if "_" in c and not c.startswith("Date")])}')
-        EOF
-    
     - name: Train model
       run: |
         echo "Starting training at $(date)"
@@ -75,27 +53,22 @@ jobs:
         echo "Generating signals at $(date)"
         python generate_signals.py
     
-    - name: Upload all results to HF Hub
+    - name: Upload results to HF Hub
       env:
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
       run: |
         if [ -z "$HF_TOKEN" ]; then
-          echo "❌ HF_TOKEN not available in environment"
-          echo "Skipping upload"
+          echo "❌ HF_TOKEN not set. Skipping upload."
+          echo "Please add HF_TOKEN at: https://github.com/${{ github.repository }}/settings/secrets/actions"
           exit 0
         fi
-        echo "✓ HF_TOKEN is set, starting upload..."
-        echo "Uploading results to HF: P2SAMAPA/p2-etf-koopman-spectral-results"
+        echo "✓ HF_TOKEN is set, uploading..."
         python hf_results_uploader.py
     
     - name: Summary
       run: |
         echo "=== Run Complete ==="
-        echo "Generated files:"
-        ls -la signals/ 2>/dev/null || echo "No signals directory"
-        ls -la *.pt 2>/dev/null || echo "No model files"
+        ls -la signals/ 2>/dev/null || echo "No signals"
         if [ -f hf_upload_manifest.json ]; then
-          echo ""
-          echo "Upload manifest:"
           cat hf_upload_manifest.json
         fi
