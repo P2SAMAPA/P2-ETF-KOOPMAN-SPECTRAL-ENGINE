@@ -29,18 +29,29 @@ jobs:
         pip install --upgrade pip
         pip install -r requirements.txt
     
+    - name: Check HF_TOKEN
+      run: |
+        if [ -z "${{ secrets.HF_TOKEN }}" ]; then
+          echo "⚠️ WARNING: secrets.HF_TOKEN not set"
+          echo "Please add HF_TOKEN at: https://github.com/${{ github.repository }}/settings/secrets/actions"
+        else
+          echo "✓ secrets.HF_TOKEN is configured"
+          # Mask the token for security
+          echo "::add-mask::${{ secrets.HF_TOKEN }}"
+        fi
+    
     - name: Download training data from HF
       run: |
         mkdir -p data/p2-etf-deepm-data
-        python -c "
+        python << 'EOF'
         import requests
         url = 'https://huggingface.co/datasets/P2SAMAPA/p2-etf-deepm-data/resolve/main/data/master.parquet'
         r = requests.get(url, timeout=120)
         r.raise_for_status()
         with open('data/p2-etf-deepm-data/master.parquet', 'wb') as f:
             f.write(r.content)
-        print(f'Downloaded: {len(r.content)} bytes to data/p2-etf-deepm-data/master.parquet')
-        "
+        print(f'Downloaded: {len(r.content)} bytes')
+        EOF
     
     - name: Verify data
       run: |
@@ -50,29 +61,7 @@ jobs:
         df = pd.read_parquet('data/p2-etf-deepm-data/master.parquet')
         print(f'Rows: {len(df)}')
         print(f'Columns: {list(df.columns)[:10]}...')
-        # Count unique ETFs
-        etf_col = None
-        for col in ['symbol', 'etf', 'ticker', 'asset']:
-            if col in df.columns:
-                etf_col = col
-                break
-        if etf_col:
-            print(f'ETFs: {df[etf_col].nunique()}')
-        else:
-            print('ETF column: check columns manually')
-            print(f'Available: {list(df.columns)}')
-        EOF
-    
-    - name: Update config for local data path
-      run: |
-        python << 'EOF'
-        import yaml
-        with open('config.yaml', 'r') as f:
-            config = yaml.safe_load(f)
-        config['data']['local_path'] = 'data/p2-etf-deepm-data'
-        with open('config.yaml', 'w') as f:
-            yaml.dump(config, f)
-        print('Updated config.local_path to data/p2-etf-deepm-data')
+        print(f'ETFs detected: {len([c for c in df.columns if "_" in c and not c.startswith("Date")])}')
         EOF
     
     - name: Train model
@@ -90,13 +79,23 @@ jobs:
       env:
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
       run: |
+        if [ -z "$HF_TOKEN" ]; then
+          echo "❌ HF_TOKEN not available in environment"
+          echo "Skipping upload"
+          exit 0
+        fi
+        echo "✓ HF_TOKEN is set, starting upload..."
         echo "Uploading results to HF: P2SAMAPA/p2-etf-koopman-spectral-results"
         python hf_results_uploader.py
     
     - name: Summary
       run: |
         echo "=== Run Complete ==="
-        echo "Results uploaded to: https://huggingface.co/datasets/P2SAMAPA/p2-etf-koopman-spectral-results"
+        echo "Generated files:"
+        ls -la signals/ 2>/dev/null || echo "No signals directory"
+        ls -la *.pt 2>/dev/null || echo "No model files"
         if [ -f hf_upload_manifest.json ]; then
+          echo ""
+          echo "Upload manifest:"
           cat hf_upload_manifest.json
         fi
