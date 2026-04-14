@@ -2,15 +2,29 @@
 # Research only · Not financial advice
 
 data:
-  source: "p2-etf-deepm-data"  # Shared data hub
+  # HuggingFace dataset configuration
+  hf_dataset: "P2SAMAPA/p2-etf-deepm-data"
+  hf_file: "data/master.parquet"  # Path within repo
+  
+  # Local fallback path (GitHub Actions / local dev)
+  local_path: "/mnt/data/p2-etf-deepm-data"
+  
+  # ETF universe (must match symbols in master.parquet)
   etf_universe: ["SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLRE", "XLB", 
                  "XLP", "XLU", "GDX", "XME", "IWM", "TLT", "LQD", "HYG", 
                  "VNQ", "GLD", "SLV", "VCIT"]
-  macro_features: ["VIX", "T10Y2Y", "DXY", "HY_IG_spread", "WTI", "DTB3"]
+  
+  # Macro features to extract from master.parquet (flexible matching)
+  macro_features: ["VIX", "T10Y2Y", "DXY", "HY", "IG", "WTI", "DTB3", "T10Y", "spread"]
+  
+  # Training period
   train_start: "2008-01-01"
   train_end: "2025-12-31"
-  val_days: 252  # 1 year validation for conformal calibration
+  val_days: 252
+  
+  # Window configuration
   lookback_window: 63  # 3 months of daily data per sample
+  target_horizon: 5    # 5-day prediction
   
 model:
   observable_dim: 64        # Koopman observables (K)
@@ -29,8 +43,8 @@ training:
   
 signals:
   output_dir: "signals"
-  modes_to_track: 5         # Top K modes to report (growth, oscillatory, decay)
-  predictability_threshold: 0.7  # Spectral gap ratio for "predictable" flag
+  predictability_threshold: 0.6  # Minimum predictability to include
+  modes_to_track: 5         # Top K modes to report
 
 github_actions:
   max_runtime_minutes: 300  # 5 hour safety margin
