@@ -3,11 +3,11 @@ Daily signal generation for Koopman-Spectral engine.
 Handles wide-format master.parquet.
 """
 
-import torch
 import pandas as pd
 import numpy as np
 import yaml
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +15,8 @@ from data_loader import load_config, HFDataLoader
 
 
 class NYSECalendar:
+    """NYSE trading calendar for next valid trading date."""
+    
     HOLIDAYS_2026 = [
         "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
         "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
@@ -40,28 +42,25 @@ class NYSECalendar:
         return dt.strftime("%A, %B %d, %Y")
 
 
-def convert_to_serializable(obj):
-    """Convert numpy types to Python native types for JSON serialization."""
-    if isinstance(obj, np.bool_):
+def to_python_type(obj):
+    """Convert numpy types to Python native types."""
+    if isinstance(obj, (np.bool_, bool)):
         return bool(obj)
-    elif isinstance(obj, np.integer):
+    elif isinstance(obj, (np.integer, int)):
         return int(obj)
-    elif isinstance(obj, np.floating):
+    elif isinstance(obj, (np.floating, float)):
         return float(obj)
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
     elif isinstance(obj, dict):
-        return {k: convert_to_serializable(v) for k, v in obj.items()}
+        return {k: to_python_type(v) for k, v in obj.items()}
     elif isinstance(obj, list):
-        return [convert_to_serializable(i) for i in obj]
+        return [to_python_type(i) for i in obj]
     return obj
 
 
 def generate_signals_simple(config):
-    """
-    Generate signals using simple momentum (no model required).
-    Uses wide-format data.
-    """
+    """Generate signals using simple momentum."""
     etfs = config['data']['etf_universe']
     lookback = config['data']['lookback_window']
     
@@ -70,9 +69,8 @@ def generate_signals_simple(config):
         local_path=config['data'].get('local_path', 'data/p2-etf-deepm-data')
     )
     
-    # Check available ETFs
     available_etfs = loader.get_all_etfs()
-    print(f"Available ETFs in data: {available_etfs[:10]}...")
+    print(f"Available ETFs: {available_etfs[:10]}...")
     
     signals = []
     
@@ -82,28 +80,26 @@ def generate_signals_simple(config):
             continue
         
         df = loader.get_etf_data(etf, lookback=lookback)
-        
         if df is None or len(df) < lookback * 0.8:
             continue
         
-        # Calculate momentum and predictability
+        # Get returns
+        returns = None
         if 'log_returns' in df.columns:
             returns = df['log_returns'].dropna()
         elif 'returns' in df.columns:
             returns = df['returns'].dropna()
-        else:
+        
+        if returns is None or len(returns) < 20:
             continue
         
-        if len(returns) < 20:
-            continue
+        momentum = float(returns.mean())
+        volatility = float(returns.std())
         
-        momentum = returns.mean()
-        volatility = returns.std()
-        
-        # Simple predictability based on vol
         predictability = min(0.95, max(0.3, 1.0 / (1.0 + volatility * 100)))
+        predicted_1d = momentum * 10000
         
-        # Regime detection
+        # Determine regime
         if momentum > 0.001:
             regime = "expansion"
         elif momentum < -0.001:
@@ -111,14 +107,11 @@ def generate_signals_simple(config):
         else:
             regime = "oscillatory"
         
-        # Predicted return in bps
-        predicted_1d = momentum * 10000
-        
         signals.append({
             'etf': str(etf),
             'predicted_1d_return': float(predicted_1d),
             'predictability_index': float(predictability),
-            'is_predictable': bool(predictability > 0.6),  # Convert to Python bool
+            'is_predictable': bool(predictability > 0.6),
             'koopman_regime': str(regime),
             'momentum': float(momentum),
             'volatility': float(volatility)
@@ -130,25 +123,26 @@ def generate_signals_simple(config):
     # Sort by predicted return
     signals_sorted = sorted(signals, key=lambda x: x['predicted_1d_return'], reverse=True)
     
-    # Top 3
+    # Get top 3
     top3 = signals_sorted[:3]
     primary = top3[0]
     runners = top3[1:3] if len(top3) > 1 else []
     
     next_trading = NYSECalendar.get_next_trading_date()
     
+    # Build result with explicit type conversion
     result = {
         'engine': 'KOOPMAN-SPECTRAL',
         'version': '1.0.0',
         'timestamp': datetime.now().isoformat(),
-        'signal_date': next_trading.strftime('%Y-%m-%d'),
+        'signal_date': str(next_trading.strftime('%Y-%m-%d')),
         'target_date': 'Next NYSE Open: ' + NYSECalendar.format_trading_date(next_trading),
         'objective': 'MAXIMUM PREDICTED RETURN',
         'data_source': 'HF: P2SAMAPA/p2-etf-deepm-data/data/master.parquet',
         'results_repo': 'HF: P2SAMAPA/p2-etf-koopman-spectral-results',
         'primary_pick': {
             'etf': str(primary['etf']),
-            'rank': 1,
+            'rank': int(1),
             'predicted_1d_return_bps': round(float(primary['predicted_1d_return']), 1),
             'predicted_1d_return_pct': round(float(primary['predicted_1d_return']) / 100, 3),
             'predictability_index': round(float(primary['predictability_index']), 3),
@@ -169,11 +163,11 @@ def generate_signals_simple(config):
         'koopman_modes': {
             'regime': str(primary['koopman_regime']),
             'predictability_index': round(float(primary['predictability_index']), 3),
-            'growth_modes': 2 if primary['koopman_regime'] == 'expansion' else 0,
-            'oscillatory_modes': 3 if primary['koopman_regime'] == 'oscillatory' else 1,
-            'decay_modes': 60 if primary['koopman_regime'] == 'contraction' else 61
+            'growth_modes': int(2 if primary['koopman_regime'] == 'expansion' else 0),
+            'oscillatory_modes': int(3 if primary['koopman_regime'] == 'oscillatory' else 1),
+            'decay_modes': int(60 if primary['koopman_regime'] == 'contraction' else 61)
         },
-        'all_etfs': convert_to_serializable(signals_sorted),  # Convert all numpy types
+        'all_etfs': to_python_type(signals_sorted),
         'metadata': {
             'total_etfs_analyzed': int(len(signals)),
             'predictable_etfs': int(sum(1 for s in signals if s['is_predictable'])),
@@ -186,7 +180,6 @@ def generate_signals_simple(config):
 
 def main():
     config = load_config()
-    
     print(f"Generating signals...")
     
     try:
@@ -198,24 +191,35 @@ def main():
         
         today = signals['signal_date']
         output_file = output_dir / f"koopman_signals_{today}.json"
+        
         with open(output_file, 'w') as f:
             json.dump(signals, f, indent=2)
         
         print(f"Saved to {output_file}")
-        print(f"\nTop 3:")
+        print(f"\nTop 3 by predicted return:")
         print(f"  1. {signals['primary_pick']['etf']}: {signals['primary_pick']['predicted_1d_return_bps']:+.1f} bps")
         for r in signals['runner_up_picks']:
             print(f"  {r['rank']}. {r['etf']}: {r['predicted_1d_return_bps']:+.1f} bps")
         
-        # Try HF upload
-        try:
-            from hf_results_uploader import upload_signals, get_hf_token, ensure_repo_exists
-            token = get_hf_token()
+        # Upload to HF - check if we're in CI
+        from hf_results_uploader import upload_signals, get_hf_token, ensure_repo_exists
+        
+        if os.environ.get('CI') == 'true':
+            # In CI, require token and fail if not available
+            print("CI environment detected, attempting HF upload...")
+            token = get_hf_token()  # This will raise if not set
             ensure_repo_exists(token)
             url = upload_signals(signals, token)
-            print(f"\nUploaded to HF: {url}")
-        except Exception as e:
-            print(f"\nHF upload skipped: {e}")
+            print(f"\n✓ Uploaded to HF: {url}")
+        else:
+            # Local run - optional upload
+            try:
+                token = get_hf_token()
+                ensure_repo_exists(token)
+                url = upload_signals(signals, token)
+                print(f"\n✓ Uploaded to HF: {url}")
+            except Exception as e:
+                print(f"\n⚠ HF upload skipped: {e}")
         
     except Exception as e:
         print(f"Error: {e}")
