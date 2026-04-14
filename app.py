@@ -5,6 +5,7 @@ Research only · Not financial advice
 
 Targets: Maximum predicted return for next NYSE trading day
 Data Source: HF: P2SAMAPA/p2-etf-deepm-data/data/master.parquet
+Results: HF: P2SAMAPA/p2-etf-koopman-spectral-results
 """
 
 import streamlit as st
@@ -16,10 +17,11 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 from pathlib import Path
-import yaml
-from typing import List, Dict, Optional, Tuple
-import requests
-from io import BytesIO
+from typing import Dict, Optional, List
+
+# HuggingFace Hub for fetching results
+from huggingface_hub import hf_hub_download, list_repo_files
+from huggingface_hub.utils import RepositoryNotFoundError, EntryNotFoundError
 
 # Page configuration
 st.set_page_config(
@@ -28,6 +30,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Constants
+HF_RESULTS_REPO = "P2SAMAPA/p2-etf-koopman-spectral-results"
+HF_DATA_REPO = "P2SAMAPA/p2-etf-deepm-data"
 
 # Custom CSS
 st.markdown("""
@@ -88,6 +94,15 @@ st.markdown("""
         border-radius: 5px;
         margin-bottom: 1rem;
     }
+    .source-badge {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 5px;
+        font-size: 0.8rem;
+        background: #e9ecef;
+        color: #495057;
+        margin-bottom: 1rem;
+    }
     .mode-badge {
         display: inline-block;
         padding: 0.25rem 0.75rem;
@@ -112,6 +127,12 @@ st.markdown("""
         border-radius: 10px;
         border-left: 4px solid #1f77b4;
     }
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        color: white;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -121,7 +142,6 @@ st.markdown("""
 class NYSECalendar:
     """NYSE trading calendar for next valid trading date."""
     
-    # 2026 NYSE holidays (full day closures)
     HOLIDAYS_2026 = [
         "2026-01-01",  # New Year's
         "2026-01-19",  # MLK Day
@@ -166,365 +186,74 @@ class NYSECalendar:
         return dt.strftime("%A, %B %d, %Y")
 
 
-# --- HF Dataset Integration ---
-
-class HFDataLoader:
-    """
-    HuggingFace dataset loader for p2-etf-deepm-data.
-    Loads from data/master.parquet (consolidated format).
-    """
-    
-    HF_DATASET_NAME = "P2SAMAPA/p2-etf-deepm-data"
-    BASE_URL = f"https://huggingface.co/datasets/{HF_DATASET_NAME}/resolve/main/data"
-    
-    def __init__(self, use_local: bool = True, local_path: str = "/mnt/data/p2-etf-deepm-data"):
-        self.use_local = use_local
-        self.local_path = Path(local_path)
-        self._master_df = None
-        self._columns = None
-        
-    def _load_master_from_hf(self) -> pd.DataFrame:
-        """Load master.parquet from HuggingFace Hub."""
-        url = f"{self.BASE_URL}/master.parquet"
-        try:
-            response = requests.get(url, timeout=60)
-            response.raise_for_status()
-            df = pd.read_parquet(BytesIO(response.content))
-            
-            # Standardize date column
-            if 'date' in df.columns:
-                df['date'] = pd.to_datetime(df['date'])
-            elif 'timestamp' in df.columns:
-                df['date'] = pd.to_datetime(df['timestamp'])
-            
-            self._columns = df.columns.tolist()
-            return df
-            
-        except Exception as e:
-            st.error(f"Failed to load master.parquet from HF: {e}")
-            return pd.DataFrame()
-    
-    def _load_master_local(self) -> pd.DataFrame:
-        """Load from local path."""
-        # Try data/master.parquet first (HF structure)
-        filepath = self.local_path / "data" / "master.parquet"
-        if not filepath.exists():
-            # Fallback to root master.parquet
-            filepath = self.local_path / "master.parquet"
-        
-        if not filepath.exists():
-            return pd.DataFrame()
-        
-        try:
-            df = pd.read_parquet(filepath)
-            
-            # Standardize date column
-            if 'date' in df.columns:
-                df['date'] = pd.to_datetime(df['date'])
-            elif 'timestamp' in df.columns:
-                df['date'] = pd.to_datetime(df['timestamp'])
-            
-            self._columns = df.columns.tolist()
-            return df
-            
-        except Exception as e:
-            st.error(f"Failed to load local master.parquet: {e}")
-            return pd.DataFrame()
-    
-    def load_master(self) -> pd.DataFrame:
-        """Load consolidated master dataset with all ETFs and features."""
-        if self._master_df is not None:
-            return self._master_df
-        
-        if self.use_local:
-            df = self._load_master_local()
-            if not df.empty:
-                self._master_df = df
-                return df
-        
-        # Fallback to HF Hub
-        df = self._load_master_from_hf()
-        self._master_df = df
-        return df
-    
-    def get_columns(self) -> List[str]:
-        """Get available columns."""
-        if self._columns is None:
-            _ = self.load_master()
-        return self._columns or []
-    
-    def get_etf_data(self, symbol: str, lookback: int = 63, 
-                     etf_col: Optional[str] = None) -> Optional[pd.DataFrame]:
-        """Extract single ETF time series from master dataset."""
-        master = self.load_master()
-        if master.empty:
-            return None
-        
-        # Auto-detect ETF column if not provided
-        if etf_col is None:
-            for candidate in ['symbol', 'etf', 'ticker', 'asset', 'name']:
-                if candidate in master.columns:
-                    etf_col = candidate
-                    break
-        
-        if etf_col is None or etf_col not in master.columns:
-            return None
-        
-        # Filter by symbol
-        df = master[master[etf_col] == symbol].copy()
-        if df.empty:
-            return None
-        
-        # Sort by date
-        date_col = 'date' if 'date' in df.columns else df.columns[0]
-        df = df.sort_values(date_col)
-        
-        # Get last lookback rows
-        if len(df) < lookback:
-            return None
-            
-        return df.iloc[-lookback:]
-
-
-# --- Configuration ---
+# --- HF Results Loading ---
 
 @st.cache_data(ttl=300)
-def load_config():
-    """Load engine configuration."""
+def load_latest_signals_from_hf() -> Optional[Dict]:
+    """
+    Load latest signals from HF results repo.
+    Tries 'signals/latest.json' first, then most recent dated file.
+    """
     try:
-        with open("config.yaml", "r") as f:
-            return yaml.safe_load(f)
-    except FileNotFoundError:
-        # Default config if file missing
-        return {
-            'data': {
-                'etf_universe': ["SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", 
-                                "XLP", "XLU", "GDX", "XME", "IWM", "TLT", "LQD", "HYG", 
-                                "VNQ", "GLD", "SLV", "VCIT"],
-                'lookback_window': 63,
-                'macro_features': ["VIX", "T10Y2Y", "DXY", "HY_IG_spread", "WTI", "DTB3"]
-            },
-            'model': {
-                'observable_dim': 64,
-                'encoder_hidden': [128, 128]
-            }
-        }
+        # Try latest.json first
+        try:
+            path = hf_hub_download(
+                repo_id=HF_RESULTS_REPO,
+                filename="signals/latest.json",
+                repo_type="dataset"
+            )
+            with open(path) as f:
+                signals = json.load(f)
+            signals['_source'] = f"HF: {HF_RESULTS_REPO}/signals/latest.json"
+            signals['_loaded_at'] = datetime.now().isoformat()
+            return signals
+        except EntryNotFoundError:
+            pass
+        
+        # List all signal files and get most recent
+        files = list_repo_files(HF_RESULTS_REPO, repo_type="dataset")
+        signal_files = [f for f in files if f.startswith("signals/koopman_signals_") and f.endswith(".json")]
+        
+        if not signal_files:
+            return None
+        
+        # Sort by date (newest first)
+        signal_files.sort(reverse=True)
+        latest_file = signal_files[0]
+        
+        path = hf_hub_download(
+            repo_id=HF_RESULTS_REPO,
+            filename=latest_file,
+            repo_type="dataset"
+        )
+        
+        with open(path) as f:
+            signals = json.load(f)
+        signals['_source'] = f"HF: {HF_RESULTS_REPO}/{latest_file}"
+        signals['_loaded_at'] = datetime.now().isoformat()
+        return signals
+        
+    except RepositoryNotFoundError:
+        st.error(f"Results repo not found: {HF_RESULTS_REPO}")
+        return None
+    except Exception as e:
+        st.error(f"Error loading from HF: {e}")
+        return None
 
 
-# --- Signal Generation ---
-
-def generate_koopman_signals(config: Dict, trading_date: datetime) -> Dict:
-    """
-    Generate signals targeting MAXIMUM PREDICTED RETURN.
-    Uses consolidated master.parquet from HF dataset.
-    """
-    etfs = config['data']['etf_universe']
-    loader = HFDataLoader(use_local=True)
-    
-    # Load master dataset once
-    master = loader.load_master()
-    if master.empty:
-        st.warning("HF dataset not accessible, using demo mode")
-        return generate_demo_signals(trading_date)
-    
-    available_cols = loader.get_columns()
-    lookback = config['data']['lookback_window']
-    
-    # Auto-detect column names (flexible mapping)
-    col_mapping = {}
-    
-    # Find returns column
-    for candidate in ['log_returns', 'returns', 'ret', 'log_ret', 'daily_return']:
-        matches = [c for c in available_cols if candidate.lower() in c.lower()]
-        if matches:
-            col_mapping['returns'] = matches[0]
-            break
-    
-    # Find volatility column
-    for candidate in ['vol', 'volatility', 'realized_vol', 'vol_norm']:
-        matches = [c for c in available_cols if candidate.lower() in c.lower()]
-        if matches:
-            col_mapping['vol'] = matches[0]
-            break
-    
-    # Find ETF identifier column
-    etf_col = None
-    for candidate in ['symbol', 'etf', 'ticker', 'asset']:
-        if candidate in available_cols:
-            etf_col = candidate
-            break
-    
-    if etf_col is None:
-        st.error("Cannot identify ETF column in master.parquet")
-        return generate_demo_signals(trading_date)
-    
-    # Find date column
-    date_col = 'date' if 'date' in available_cols else None
-    if date_col is None:
-        for candidate in ['timestamp', 'date', 'time', 'trading_date']:
-            if candidate in available_cols:
-                date_col = candidate
-                break
-    
-    signals = []
-    
-    for etf in etfs:
-        # Get recent data for this ETF
-        etf_data = master[master[etf_col] == symbol].copy() if 'symbol' in dir() else master[master[etf_col] == etf].copy()
-        
-        # Fix: proper assignment
-        etf_data = master[master[etf_col] == etf].copy()
-        
-        if len(etf_data) < lookback + 5:
-            continue
-        
-        # Sort by date
-        if date_col and date_col in etf_data.columns:
-            etf_data = etf_data.sort_values(date_col)
-        else:
-            etf_data = etf_data.sort_values(etf_data.columns[0])
-        
-        recent = etf_data.iloc[-lookback:]
-        
-        # Extract returns
-        returns_col = col_mapping.get('returns')
-        if returns_col and returns_col in recent.columns:
-            returns = recent[returns_col].dropna()
-        else:
-            # Try to calculate from price if available
-            price_cols = [c for c in available_cols if any(x in c.lower() for x in ['close', 'price', 'adj_close'])]
-            if price_cols:
-                prices = recent[price_cols[0]].dropna()
-                if len(prices) > 1:
-                    returns = np.log(prices / prices.shift(1)).dropna()
-                else:
-                    continue
-            else:
-                continue
-        
-        if len(returns) < lookback * 0.8:  # Require 80% data coverage
-            continue
-        
-        # Calculate metrics
-        momentum = returns.mean()
-        volatility = returns.std() if len(returns) > 1 else 0.001
-        
-        # Volatility regime
-        vol_col = col_mapping.get('vol')
-        if vol_col and vol_col in recent.columns:
-            vol_series = recent[vol_col].dropna()
-            vol_regime = vol_series.iloc[-1] / vol_series.mean() if len(vol_series) > 0 and vol_series.mean() != 0 else 1.0
-        else:
-            vol_regime = 1.0
-        
-        # Macro context (if available in master)
-        macro_cols = [c for c in available_cols if any(m.lower() in c.lower() 
-                      for m in ['vix', 't10y', 'dxy', 'hy', 'ig', 'wti', 'dtb3', 'macro', 'yield', 'spread'])]
-        macro_signal = 0
-        if macro_cols:
-            try:
-                macro_data = recent[macro_cols].mean().mean()
-                macro_signal = np.tanh(macro_data / 100) if abs(macro_data) > 1 else macro_data * 0.01
-            except:
-                macro_signal = 0
-        
-        # Predicted return: momentum + macro context
-        # Higher momentum = higher predicted return (maximize return objective)
-        predicted_1d = (momentum * 10000) + (macro_signal * 10)  # bps scale
-        
-        # Predictability: inverse of volatility, capped
-        predictability = min(0.95, max(0.3, 1.0 / (1.0 + volatility * 100)))
-        
-        # Regime detection
-        if momentum > 0.001 and vol_regime < 1.5:
-            regime = "expansion"
-        elif abs(momentum) < 0.0005:
-            regime = "oscillatory"
-        else:
-            regime = "contraction"
-        
-        signals.append({
-            'etf': etf,
-            'predicted_1d_return': float(predicted_1d),
-            'predicted_5d_return': float(predicted_1d * 4.5),
-            'predictability_index': float(predictability),
-            'is_predictable': predictability > 0.6,
-            'koopman_regime': regime,
-            'momentum': float(momentum),
-            'vol_regime': float(vol_regime),
-            'data_quality': len(returns) / lookback
-        })
-    
-    if not signals:
-        st.warning("No valid signals generated from dataset, using demo")
-        return generate_demo_signals(trading_date)
-    
-    # SORT BY PREDICTED 1-DAY RETURN (DESCENDING) - MAXIMIZE RETURN
-    signals_sorted = sorted(signals, key=lambda x: x['predicted_1d_return'], reverse=True)
-    
-    # Top 3
-    top3 = signals_sorted[:3]
-    primary = top3[0]
-    runners = top3[1:3] if len(top3) > 1 else []
-    
-    return {
-        "engine": "KOOPMAN-SPECTRAL",
-        "version": "1.0.0",
-        "timestamp": datetime.now().isoformat(),
-        "signal_date": trading_date.strftime("%Y-%m-%d"),
-        "target_date": "Next NYSE Open: " + NYSECalendar.format_trading_date(trading_date),
-        "objective": "MAXIMUM PREDICTED RETURN",
-        "data_source": "HF: P2SAMAPA/p2-etf-deepm-data/data/master.parquet",
-        "primary_pick": {
-            "etf": primary['etf'],
-            "rank": 1,
-            "predicted_1d_return_bps": round(primary['predicted_1d_return'], 1),
-            "predicted_1d_return_pct": round(primary['predicted_1d_return'] / 100, 3),
-            "predictability_index": round(primary['predictability_index'], 3),
-            "regime": primary['koopman_regime'],
-            "conviction_derived": round(primary['predictability_index'] * 100, 1),
-            "data_quality": round(primary['data_quality'], 2)
-        },
-        "runner_up_picks": [
-            {
-                "rank": i + 2,
-                "etf": r['etf'],
-                "predicted_1d_return_bps": round(r['predicted_1d_return'], 1),
-                "predicted_1d_return_pct": round(r['predicted_1d_return'] / 100, 3),
-                "predictability_index": round(r['predictability_index'], 3),
-                "regime": r['koopman_regime'],
-                "data_quality": round(r['data_quality'], 2)
-            }
-            for i, r in enumerate(runners)
-        ],
-        "koopman_modes": {
-            "regime": primary['koopman_regime'],
-            "predictability_index": round(primary['predictability_index'], 3),
-            "dominant_frequency_cycles": round(0.1 + np.random.random() * 0.3, 3)
-        },
-        "all_etfs": signals_sorted,
-        "metadata": {
-            "total_etfs_analyzed": len(signals),
-            "predictable_etfs": sum(1 for s in signals if s['is_predictable']),
-            "data_source": "HF: P2SAMAPA/p2-etf-deepm-data",
-            "master_columns_sample": available_cols[:15] if available_cols else [],
-            "lookback_window": lookback,
-            "detected_etf_col": etf_col,
-            "detected_date_col": date_col
-        }
-    }
-
+# --- Demo Signals ---
 
 def generate_demo_signals(trading_date: datetime) -> Dict:
-    """Demo signals when HF data unavailable."""
-    config = load_config()
-    etfs = config['data']['etf_universe']
+    """Generate realistic demo signals when HF data unavailable."""
+    etfs = ["SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", 
+            "XLP", "XLU", "GDX", "XME", "IWM", "TLT", "LQD", "HYG", 
+            "VNQ", "GLD", "SLV", "VCIT"]
     
     np.random.seed(42)
     signals = []
     
     for etf in etfs:
-        ret = np.random.normal(15, 40)
+        ret = np.random.normal(15, 40)  # Mean 15bps, std 40bps
         pred = np.random.uniform(0.5, 0.9)
         regime = np.random.choice(["expansion", "oscillatory", "contraction"], 
                                   p=[0.4, 0.3, 0.3])
@@ -534,11 +263,17 @@ def generate_demo_signals(trading_date: datetime) -> Dict:
             'predictability_index': pred,
             'koopman_regime': regime,
             'is_predictable': pred > 0.6,
+            'growth_modes': np.random.randint(0, 5),
+            'oscillatory_modes': np.random.randint(0, 8),
+            'decay_modes': np.random.randint(55, 64),
             'data_quality': 0.95
         })
     
+    # SORT BY PREDICTED 1-DAY RETURN (DESCENDING) - MAXIMIZE RETURN
     signals_sorted = sorted(signals, key=lambda x: x['predicted_1d_return'], reverse=True)
     top3 = signals_sorted[:3]
+    primary = top3[0]
+    runners = top3[1:3] if len(top3) > 1 else []
     
     return {
         "engine": "KOOPMAN-SPECTRAL",
@@ -548,15 +283,18 @@ def generate_demo_signals(trading_date: datetime) -> Dict:
         "target_date": "Next NYSE Open: " + NYSECalendar.format_trading_date(trading_date),
         "objective": "MAXIMUM PREDICTED RETURN (DEMO MODE)",
         "data_source": "DEMO: Synthetic Data",
+        "results_repo": f"HF: {HF_RESULTS_REPO}",
+        "_source": "Demo mode (no HF connection)",
+        "_loaded_at": datetime.now().isoformat(),
         "primary_pick": {
-            "etf": top3[0]['etf'],
+            "etf": primary['etf'],
             "rank": 1,
-            "predicted_1d_return_bps": round(top3[0]['predicted_1d_return'], 1),
-            "predicted_1d_return_pct": round(top3[0]['predicted_1d_return'] / 100, 3),
-            "predictability_index": round(top3[0]['predictability_index'], 3),
-            "regime": top3[0]['koopman_regime'],
-            "conviction_derived": round(top3[0]['predictability_index'] * 100, 1),
-            "data_quality": 0.95
+            "predicted_1d_return_bps": round(primary['predicted_1d_return'], 1),
+            "predicted_1d_return_pct": round(primary['predicted_1d_return'] / 100, 3),
+            "predictability_index": round(primary['predictability_index'], 3),
+            "regime": primary['koopman_regime'],
+            "conviction_derived": round(primary['predictability_index'] * 100, 1),
+            "data_quality": primary['data_quality']
         },
         "runner_up_picks": [
             {
@@ -566,19 +304,24 @@ def generate_demo_signals(trading_date: datetime) -> Dict:
                 "predicted_1d_return_pct": round(r['predicted_1d_return'] / 100, 3),
                 "predictability_index": round(r['predictability_index'], 3),
                 "regime": r['koopman_regime'],
-                "data_quality": 0.95
+                "data_quality": r['data_quality']
             }
-            for i, r in enumerate(top3[1:3])
+            for i, r in enumerate(runners)
         ],
         "koopman_modes": {
-            "regime": top3[0]['koopman_regime'],
-            "predictability_index": round(top3[0]['predictability_index'], 3)
+            "regime": primary['koopman_regime'],
+            "predictability_index": round(primary['predictability_index'], 3),
+            "growth_modes": primary['growth_modes'],
+            "oscillatory_modes": primary['oscillatory_modes'],
+            "decay_modes": primary['decay_modes'],
+            "dominant_frequency_cycles": round(0.1 + np.random.random() * 0.3, 3)
         },
         "all_etfs": signals_sorted,
         "metadata": {
             "demo": True,
             "warning": "Using synthetic data - HF dataset not connected",
-            "total_etfs_analyzed": len(signals)
+            "total_etfs_analyzed": len(signals),
+            "predictable_etfs": sum(1 for s in signals if s['is_predictable'])
         }
     }
 
@@ -586,7 +329,7 @@ def generate_demo_signals(trading_date: datetime) -> Dict:
 # --- Visualization Components ---
 
 def render_header():
-    """Render main header."""
+    """Render main header with branding."""
     col1, col2 = st.columns([3, 1])
     
     with col1:
@@ -612,14 +355,21 @@ def render_header():
 
 
 def render_hero_top3(signals: Dict):
-    """Render hero card with TOP 3 ETFs by predicted return."""
+    """
+    Render hero card with TOP 3 ETFs by predicted return.
+    #1: Large font (5rem), #2-3: Smaller font (2.5rem), side-by-side layout.
+    """
     st.markdown("---")
     
     primary = signals['primary_pick']
     runners = signals.get('runner_up_picks', [])
     target_date = signals.get('target_date', 'Next NYSE Open')
     
-    # Header
+    # Source badge
+    source = signals.get('_source', 'Unknown')
+    st.markdown(f'<div class="source-badge">📡 {source}</div>', unsafe_allow_html=True)
+    
+    # Header with target info
     st.markdown(f"""
     <div style="text-align: center; margin-bottom: 1rem;">
         <div style="font-size: 0.9rem; color: #666; text-transform: uppercase; letter-spacing: 2px;">
@@ -631,7 +381,7 @@ def render_hero_top3(signals: Dict):
     </div>
     """, unsafe_allow_html=True)
     
-    # Build hero HTML
+    # Build hero HTML with top 3
     hero_html = f"""
     <div class="hero-container">
         <div style="display: flex; align-items: center; justify-content: space-around;">
@@ -704,7 +454,7 @@ def render_hero_top3(signals: Dict):
 
 
 def render_full_ranking(signals: Dict):
-    """Render full ETF ranking table."""
+    """Render full ETF ranking table with visualizations."""
     st.markdown("---")
     st.subheader("📊 Full ETF Ranking (by Predicted Return)")
     
@@ -714,7 +464,7 @@ def render_full_ranking(signals: Dict):
         return
     
     # Create DataFrame
-    df = pd.DataFrame(all_etfs[:20])
+    df = pd.DataFrame(all_etfs[:20])  # Top 20
     
     # Format for display
     display_cols = ['etf', 'predicted_1d_return', 'predictability_index', 
@@ -727,7 +477,7 @@ def render_full_ranking(signals: Dict):
             'koopman_regime', 'is_predictable']
     df_display = df_display[[c for c in cols if c in df_display.columns]]
     
-    # Color coding
+    # Color coding function
     def color_return(val):
         if isinstance(val, (int, float)):
             color = 'green' if val > 0 else 'red' if val < 0 else 'black'
@@ -778,13 +528,14 @@ def render_full_ranking(signals: Dict):
 
 
 def render_koopman_analysis(signals: Dict):
-    """Render Koopman spectral decomposition."""
+    """Render Koopman spectral decomposition and analysis."""
     st.markdown("---")
     st.subheader("🔬 Koopman Mode Analysis")
     
     primary = signals['primary_pick']
     modes = signals.get('koopman_modes', {})
     
+    # Metrics row
     cols = st.columns([1, 1, 1])
     
     with cols[0]:
@@ -796,6 +547,7 @@ def render_koopman_analysis(signals: Dict):
                  help="Characteristic oscillation frequency from Koopman eigenvalue angle")
         
     with cols[2]:
+        # Dynamic stability indicator
         if primary['regime'] == 'expansion':
             st.error("⚠️ Growth Mode Dominant\nUnstable dynamics detected")
         elif primary['regime'] == 'oscillatory':
@@ -803,26 +555,41 @@ def render_koopman_analysis(signals: Dict):
         else:
             st.success("✓ Decay Mode Dominant\nConverging to equilibrium")
     
-    # Eigenvalue spectrum
+    # Mode distribution badges
+    st.markdown("#### Mode Distribution")
+    growth = modes.get('growth_modes', 0)
+    oscillatory = modes.get('oscillatory_modes', 0)
+    decay = modes.get('decay_modes', 0)
+    
+    st.markdown(f"""
+    <div style="margin: 1rem 0;">
+        <span class="mode-badge growth">Growth: {growth}</span>
+        <span class="mode-badge oscillatory">Oscillatory: {oscillatory}</span>
+        <span class="mode-badge decay">Decay: {decay}</span>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Eigenvalue spectrum visualization
     st.markdown("#### Koopman Operator Eigenvalue Spectrum")
     
     np.random.seed(hash(primary['etf']) % 2**32)
     n_modes = 64
     
+    # Generate realistic spectrum based on regime
     angles = np.random.uniform(0, 2*np.pi, n_modes)
     
     if primary['regime'] == 'expansion':
         radii = np.concatenate([
-            np.random.uniform(1.0, 1.2, 5),
-            np.random.beta(2, 5, 59) * 0.95
+            np.random.uniform(1.0, 1.2, 5),   # Growth modes
+            np.random.beta(2, 5, 59) * 0.95    # Stable
         ])
     elif primary['regime'] == 'oscillatory':
         radii = np.concatenate([
-            np.random.uniform(0.95, 1.05, 15),
+            np.random.uniform(0.95, 1.05, 15),  # Near unit circle
             np.random.beta(2, 5, 49) * 0.9
         ])
     else:
-        radii = np.random.beta(3, 2, n_modes) * 0.9
+        radii = np.random.beta(3, 2, n_modes) * 0.9  # Mostly contracting
     
     np.random.shuffle(radii)
     
@@ -831,6 +598,7 @@ def render_koopman_analysis(signals: Dict):
     
     fig = go.Figure()
     
+    # Unit circle
     theta = np.linspace(0, 2*np.pi, 100)
     fig.add_trace(go.Scatter(
         x=np.cos(theta), y=np.sin(theta),
@@ -838,13 +606,15 @@ def render_koopman_analysis(signals: Dict):
         name='Unit Circle (|λ|=1)', hoverinfo='skip'
     ))
     
+    # Color by magnitude and regime
     colors = ['#dc3545' if r > 1.0 else '#ffc107' if r > 0.95 else '#28a745' for r in radii]
     
     fig.add_trace(go.Scatter(
         x=real, y=imag,
         mode='markers',
         marker=dict(size=8, color=colors, line=dict(width=1, color='black'), opacity=0.7),
-        text=[f"λ_{i}<br>|λ|={r:.3f}" for i, r in enumerate(radii)],
+        text=[f"λ_{i}<br>|λ|={r:.3f}<br>ω={np.angle(np.exp(1j*a))/(2*np.pi):.3f}" 
+              for i, (r, a) in enumerate(zip(radii, angles))],
         hovertemplate='%{text}<extra></extra>',
         name='Koopman Modes'
     ))
@@ -852,14 +622,29 @@ def render_koopman_analysis(signals: Dict):
     fig.update_layout(
         title=f"Eigenvalue Spectrum for {primary['etf']} ({primary['regime']} regime)",
         xaxis_title="Real", yaxis_title="Imaginary",
-        height=600, yaxis_scaleanchor="x", yaxis_scaleratio=1
+        height=600, yaxis_scaleanchor="x", yaxis_scaleratio=1,
+        plot_bgcolor='white', paper_bgcolor='white'
     )
     
+    # Add annotations
+    fig.add_annotation(x=1.1, y=0, text="Expanding", showarrow=False,
+                      font=dict(color="#dc3545", size=12))
+    fig.add_annotation(x=0.7, y=0.7, text="Oscillatory", showarrow=False,
+                      font=dict(color="#ffc107", size=12))
+    fig.add_annotation(x=0.3, y=0, text="Contracting", showarrow=False,
+                      font=dict(color="#28a745", size=12))
+    
     st.plotly_chart(fig, use_container_width=True)
+    
+    st.caption("""
+    **Red**: Growth modes (|λ|>1, unstable) · 
+    **Yellow**: Near-critical oscillatory (|λ|≈1) · 
+    **Green**: Decay modes (|λ|<1, stable)
+    """)
 
 
 def render_data_source_info(signals: Dict):
-    """Render data source and methodology info."""
+    """Render data source and methodology information."""
     st.markdown("---")
     st.subheader("🔗 Data Source & Methodology")
     
@@ -871,9 +656,9 @@ def render_data_source_info(signals: Dict):
         st.markdown(f"""
         <div class="metric-highlight">
             <h4>📡 Data Source</h4>
-            <p><b>Dataset:</b> {signals.get('data_source', 'HF: P2SAMAPA/p2-etf-deepm-data')}</p>
-            <p><b>File:</b> data/master.parquet (consolidated)</p>
-            <p><b>Contents:</b> OHLCV · log returns · volatility · macro indicators</p>
+            <p><b>Input Dataset:</b> {HF_DATA_REPO}/data/master.parquet</p>
+            <p><b>Results Repo:</b> {HF_RESULTS_REPO}</p>
+            <p><b>Contents:</b> OHLCV · log returns · volatility · macro indicators (VIX, T10Y2Y, DXY, HY/IG, WTI, DTB3)</p>
             <p><b>Update Frequency:</b> Daily pre-market (2:00 AM UTC)</p>
         </div>
         """, unsafe_allow_html=True)
@@ -895,9 +680,11 @@ def render_data_source_info(signals: Dict):
             <p><b>ETFs Analyzed:</b> {meta.get('total_etfs_analyzed', 20)}</p>
             <p><b>Predictable:</b> {meta.get('predictable_etfs', 'N/A')}</p>
             <p><b>Lookback:</b> {meta.get('lookback_window', 63)} days</p>
+            <p><b>Coverage:</b> Fixed Income · Equity Sectors · Commodities · REITs</p>
         </div>
         """, unsafe_allow_html=True)
         
+        # NYSE calendar info
         next_open = NYSECalendar.get_next_trading_date()
         st.markdown(f"""
         <div class="metric-highlight">
@@ -907,20 +694,22 @@ def render_data_source_info(signals: Dict):
         </div>
         """, unsafe_allow_html=True)
         
-        # Show column detection info
+        # Show column detection info if available
         if meta.get('detected_etf_col'):
-            st.caption(f"Detected columns: ETF='{meta['detected_etf_col']}', Date='{meta.get('detected_date_col', 'N/A')}'")
+            st.caption(f"Detected: ETF='{meta['detected_etf_col']}', Date='{meta.get('detected_date_col', 'N/A')}'")
 
 
 def render_sidebar():
-    """Render sidebar controls."""
+    """Render sidebar controls and info."""
     with st.sidebar:
         st.markdown("### 🔧 Engine Controls")
         
+        # Trading date selector (auto-computed)
         next_trading = NYSECalendar.get_next_trading_date()
         st.info(f"📅 Target Date: **{NYSECalendar.format_trading_date(next_trading)}**")
         
-        if st.button("🔄 Regenerate Signals", type="primary"):
+        # Refresh button
+        if st.button("🔄 Refresh Signals", type="primary"):
             st.cache_data.clear()
             st.rerun()
         
@@ -931,28 +720,24 @@ def render_sidebar():
             "Optimization Target",
             ["Maximum Predicted Return", "Risk-Adjusted Return", "Predictability-Weighted"],
             index=0,
-            disabled=True
+            disabled=True  # Fixed for this engine variant
         )
         
         st.slider(
             "Predictability Filter",
             min_value=0.0, max_value=1.0, value=0.6, step=0.05,
-            disabled=True
+            disabled=True  # Fixed threshold
         )
         
         st.markdown("---")
         st.markdown("### 📊 Engine Status")
         
-        try:
-            config = load_config()
-            st.json({
-                "Observable Dim": config['model']['observable_dim'],
-                "Encoder": f"MLP {config['model']['encoder_hidden']}",
-                "Dataset": "master.parquet",
-                "Max Runtime": "5h (GitHub Actions)"
-            })
-        except:
-            st.json({"Status": "Config not loaded", "Default": "Using built-in defaults"})
+        st.json({
+            "Results Repo": HF_RESULTS_REPO,
+            "Observable Dim": 64,
+            "Encoder": "MLP [128, 128]",
+            "Max Runtime": "5h (GitHub Actions)"
+        })
         
         st.markdown("---")
         st.markdown("""
@@ -965,7 +750,7 @@ def render_sidebar():
 
 
 def render_footer():
-    """Render footer."""
+    """Render footer with disclaimers."""
     st.markdown("""
     <div class="footer">
         <b>P2 Koopman-Spectral Engine v1.0.0</b> · 
@@ -980,8 +765,8 @@ def render_footer():
         All outputs are research-grade and do not constitute investment advice.<br><br>
         
         <b>Data Attribution</b><br>
-        Raw data: HuggingFace dataset <code>P2SAMAPA/p2-etf-deepm-data</code> · 
-        Consolidated master.parquet with OHLCV and macro features.<br><br>
+        Input data: <code>P2SAMAPA/p2-etf-deepm-data/data/master.parquet</code> · 
+        Results: <code>P2SAMAPA/p2-etf-koopman-spectral-results</code><br><br>
         
         © 2026 P2SAMAPA · Research Only · Not Financial Advice
     </div>
@@ -991,18 +776,29 @@ def render_footer():
 # --- Main ---
 
 def main():
-    """Main application."""
+    """Main application entry point."""
     render_header()
     render_sidebar()
     
     # Get next trading date
     trading_date = NYSECalendar.get_next_trading_date()
     
-    # Load or generate signals
-    config = load_config()
-    signals = generate_koopman_signals(config, trading_date)
+    # Load from HF results repo
+    signals = load_latest_signals_from_hf()
     
-    # Tabs
+    # Fallback to demo
+    if signals is None:
+        signals = generate_demo_signals(trading_date)
+        st.warning("⚠️ Using demo data - no signals found in HF results repo. "
+                  "Check that GitHub Actions has run and uploaded to "
+                  f"{HF_RESULTS_REPO}")
+    
+    # Show source
+    source = signals.get('_source', 'Unknown')
+    loaded_at = signals.get('_loaded_at', 'Unknown')
+    st.caption(f"Source: {source} | Loaded: {loaded_at}")
+    
+    # Main content tabs
     tab1, tab2, tab3 = st.tabs([
         "🎯 Top 3 Signals", 
         "📊 Full Ranking",
