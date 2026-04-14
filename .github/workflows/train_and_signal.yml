@@ -45,17 +45,27 @@ jobs:
     - name: Verify data
       run: |
         ls -lh data/p2-etf-deepm-data/
-        python -c "
+        python << 'EOF'
         import pandas as pd
         df = pd.read_parquet('data/p2-etf-deepm-data/master.parquet')
         print(f'Rows: {len(df)}')
         print(f'Columns: {list(df.columns)[:10]}...')
-        print(f'ETFs: {df[\\\"symbol\\\"].nunique() if \\\"symbol\\\" in df.columns else \\\"check columns\\\"}')
-        "
+        # Count unique ETFs
+        etf_col = None
+        for col in ['symbol', 'etf', 'ticker', 'asset']:
+            if col in df.columns:
+                etf_col = col
+                break
+        if etf_col:
+            print(f'ETFs: {df[etf_col].nunique()}')
+        else:
+            print('ETF column: check columns manually')
+            print(f'Available: {list(df.columns)}')
+        EOF
     
     - name: Update config for local data path
       run: |
-        python -c "
+        python << 'EOF'
         import yaml
         with open('config.yaml', 'r') as f:
             config = yaml.safe_load(f)
@@ -63,7 +73,7 @@ jobs:
         with open('config.yaml', 'w') as f:
             yaml.dump(config, f)
         print('Updated config.local_path to data/p2-etf-deepm-data')
-        "
+        EOF
     
     - name: Train model
       run: |
