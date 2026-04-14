@@ -1,13 +1,13 @@
 """
 Daily signal generation for Koopman-Spectral engine.
 Handles wide-format master.parquet.
+Saves locally only - HF upload handled by workflow.
 """
 
 import pandas as pd
 import numpy as np
 import yaml
 import json
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -201,25 +201,7 @@ def main():
         for r in signals['runner_up_picks']:
             print(f"  {r['rank']}. {r['etf']}: {r['predicted_1d_return_bps']:+.1f} bps")
         
-        # Upload to HF - check if we're in CI
-        from hf_results_uploader import upload_signals, get_hf_token, ensure_repo_exists
-        
-        if os.environ.get('CI') == 'true':
-            # In CI, require token and fail if not available
-            print("CI environment detected, attempting HF upload...")
-            token = get_hf_token()  # This will raise if not set
-            ensure_repo_exists(token)
-            url = upload_signals(signals, token)
-            print(f"\n✓ Uploaded to HF: {url}")
-        else:
-            # Local run - optional upload
-            try:
-                token = get_hf_token()
-                ensure_repo_exists(token)
-                url = upload_signals(signals, token)
-                print(f"\n✓ Uploaded to HF: {url}")
-            except Exception as e:
-                print(f"\n⚠ HF upload skipped: {e}")
+        print(f"\nSignals ready for upload to HF: P2SAMAPA/p2-etf-koopman-spectral-results")
         
     except Exception as e:
         print(f"Error: {e}")
