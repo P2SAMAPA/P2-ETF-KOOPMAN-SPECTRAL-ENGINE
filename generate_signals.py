@@ -40,6 +40,23 @@ class NYSECalendar:
         return dt.strftime("%A, %B %d, %Y")
 
 
+def convert_to_serializable(obj):
+    """Convert numpy types to Python native types for JSON serialization."""
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(i) for i in obj]
+    return obj
+
+
 def generate_signals_simple(config):
     """
     Generate signals using simple momentum (no model required).
@@ -98,11 +115,11 @@ def generate_signals_simple(config):
         predicted_1d = momentum * 10000
         
         signals.append({
-            'etf': etf,
+            'etf': str(etf),
             'predicted_1d_return': float(predicted_1d),
             'predictability_index': float(predictability),
-            'is_predictable': predictability > 0.6,
-            'koopman_regime': regime,  # KEY: use 'koopman_regime' not 'regime'
+            'is_predictable': bool(predictability > 0.6),  # Convert to Python bool
+            'koopman_regime': str(regime),
             'momentum': float(momentum),
             'volatility': float(volatility)
         })
@@ -120,7 +137,7 @@ def generate_signals_simple(config):
     
     next_trading = NYSECalendar.get_next_trading_date()
     
-    return {
+    result = {
         'engine': 'KOOPMAN-SPECTRAL',
         'version': '1.0.0',
         'timestamp': datetime.now().isoformat(),
@@ -130,39 +147,41 @@ def generate_signals_simple(config):
         'data_source': 'HF: P2SAMAPA/p2-etf-deepm-data/data/master.parquet',
         'results_repo': 'HF: P2SAMAPA/p2-etf-koopman-spectral-results',
         'primary_pick': {
-            'etf': primary['etf'],
+            'etf': str(primary['etf']),
             'rank': 1,
-            'predicted_1d_return_bps': round(primary['predicted_1d_return'], 1),
-            'predicted_1d_return_pct': round(primary['predicted_1d_return'] / 100, 3),
-            'predictability_index': round(primary['predictability_index'], 3),
-            'regime': primary['koopman_regime'],  # FIXED: use 'koopman_regime'
-            'conviction_derived': round(primary['predictability_index'] * 100, 1)
+            'predicted_1d_return_bps': round(float(primary['predicted_1d_return']), 1),
+            'predicted_1d_return_pct': round(float(primary['predicted_1d_return']) / 100, 3),
+            'predictability_index': round(float(primary['predictability_index']), 3),
+            'regime': str(primary['koopman_regime']),
+            'conviction_derived': round(float(primary['predictability_index']) * 100, 1)
         },
         'runner_up_picks': [
             {
-                'rank': i + 2,
-                'etf': r['etf'],
-                'predicted_1d_return_bps': round(r['predicted_1d_return'], 1),
-                'predicted_1d_return_pct': round(r['predicted_1d_return'] / 100, 3),
-                'predictability_index': round(r['predictability_index'], 3),
-                'regime': r['koopman_regime']  # FIXED: use 'koopman_regime'
+                'rank': int(i + 2),
+                'etf': str(r['etf']),
+                'predicted_1d_return_bps': round(float(r['predicted_1d_return']), 1),
+                'predicted_1d_return_pct': round(float(r['predicted_1d_return']) / 100, 3),
+                'predictability_index': round(float(r['predictability_index']), 3),
+                'regime': str(r['koopman_regime'])
             }
             for i, r in enumerate(runners)
         ],
         'koopman_modes': {
-            'regime': primary['koopman_regime'],  # FIXED: use 'koopman_regime'
-            'predictability_index': round(primary['predictability_index'], 3),
+            'regime': str(primary['koopman_regime']),
+            'predictability_index': round(float(primary['predictability_index']), 3),
             'growth_modes': 2 if primary['koopman_regime'] == 'expansion' else 0,
             'oscillatory_modes': 3 if primary['koopman_regime'] == 'oscillatory' else 1,
             'decay_modes': 60 if primary['koopman_regime'] == 'contraction' else 61
         },
-        'all_etfs': signals_sorted,
+        'all_etfs': convert_to_serializable(signals_sorted),  # Convert all numpy types
         'metadata': {
-            'total_etfs_analyzed': len(signals),
-            'predictable_etfs': sum(1 for s in signals if s['is_predictable']),
+            'total_etfs_analyzed': int(len(signals)),
+            'predictable_etfs': int(sum(1 for s in signals if s['is_predictable'])),
             'data_format': 'wide'
         }
     }
+    
+    return result
 
 
 def main():
