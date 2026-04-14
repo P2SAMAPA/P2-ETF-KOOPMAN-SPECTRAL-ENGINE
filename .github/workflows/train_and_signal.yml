@@ -1,0 +1,70 @@
+name: Train Koopman-Spectral and Generate Signals
+
+on:
+  schedule:
+    - cron: '0 2 * * 1-5'  # 2 AM UTC, Mon-Fri
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300  # 5 hour safety margin (under 6-hour limit)
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+    
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Cache training data
+      uses: actions/cache@v3
+      with:
+        path: /mnt/data
+        key: koopman-data-${{ github.run_id }}
+        restore-keys: koopman-data-
+    
+    - name: Train model
+      run: |
+        echo "Starting training at $(date)"
+        python train.py
+        echo "Training complete at $(date)"
+    
+    - name: Generate signals
+      run: |
+        echo "Generating signals at $(date)"
+        python generate_signals.py
+    
+    - name: Upload model artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: koopman-model-${{ github.run_id }}
+        path: |
+          koopman_spectral_*.pt
+          training_history.json
+    
+    - name: Upload signals
+      uses: actions/upload-artifact@v4
+      with:
+        name: koopman-signals-${{ github.run_id }}
+        path: signals/
+    
+    - name: Commit signals to repo (optional)
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add signals/
+        git commit -m "Update Koopman signals $(date +%Y-%m-%d)" || echo "No changes"
+        git push || echo "Push failed"
