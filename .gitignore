@@ -1,0 +1,43 @@
+# Data
+*.parquet
+*.csv
+/mnt/data/
+data/
+
+# Models
+*.pt
+*.pth
+*.ckpt
+
+# Outputs
+signals/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+training_history.json
