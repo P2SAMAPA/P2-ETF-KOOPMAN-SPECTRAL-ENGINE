@@ -8,7 +8,7 @@ on:
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 300  # 5 hour safety margin (under 6-hour limit)
+    timeout-minutes: 300  # 5 hour safety margin
     
     steps:
     - uses: actions/checkout@v4
@@ -29,12 +29,32 @@ jobs:
         pip install --upgrade pip
         pip install -r requirements.txt
     
-    - name: Cache training data
-      uses: actions/cache@v3
-      with:
-        path: /mnt/data
-        key: koopman-data-${{ github.run_id }}
-        restore-keys: koopman-data-
+    - name: Create data directory
+      run: mkdir -p /mnt/data/p2-etf-deepm-data/data
+    
+    - name: Download master.parquet from HF Hub
+      run: |
+        echo "Downloading master.parquet from HuggingFace..."
+        python -c "
+        import requests
+        url = 'https://huggingface.co/datasets/P2SAMAPA/p2-etf-deepm-data/resolve/main/data/master.parquet'
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+        with open('/mnt/data/p2-etf-deepm-data/data/master.parquet', 'wb') as f:
+            f.write(r.content)
+        print(f'Downloaded: {len(r.content)} bytes')
+        "
+    
+    - name: Verify data
+      run: |
+        ls -lh /mnt/data/p2-etf-deepm-data/data/
+        python -c "
+        import pandas as pd
+        df = pd.read_parquet('/mnt/data/p2-etf-deepm-data/data/master.parquet')
+        print(f'Rows: {len(df)}')
+        print(f'Columns: {list(df.columns)[:10]}...')
+        print(f'ETFs: {df.get(\\\"symbol\\\", df.get(\\\"etf\\\", df.iloc[:,0])).nunique()}')
+        "
     
     - name: Train model
       run: |
