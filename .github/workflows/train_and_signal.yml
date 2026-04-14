@@ -1,14 +1,14 @@
-name: Train Koopman-Spectral and Generate Signals
+name: Train Koopman-Spectral and Upload to HF
 
 on:
   schedule:
     - cron: '0 2 * * 1-5'  # 2 AM UTC, Mon-Fri
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
 
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 300  # 5 hour safety margin
+    timeout-minutes: 300
     
     steps:
     - uses: actions/checkout@v4
@@ -18,7 +18,7 @@ jobs:
       with:
         python-version: '3.11'
     
-    - name: Cache pip dependencies
+    - name: Cache pip
       uses: actions/cache@v3
       with:
         path: ~/.cache/pip
@@ -29,31 +29,40 @@ jobs:
         pip install --upgrade pip
         pip install -r requirements.txt
     
-    - name: Create data directory
-      run: mkdir -p /mnt/data/p2-etf-deepm-data/data
-    
-    - name: Download master.parquet from HF Hub
+    - name: Download training data from HF
       run: |
-        echo "Downloading master.parquet from HuggingFace..."
+        mkdir -p data/p2-etf-deepm-data
         python -c "
         import requests
         url = 'https://huggingface.co/datasets/P2SAMAPA/p2-etf-deepm-data/resolve/main/data/master.parquet'
         r = requests.get(url, timeout=120)
         r.raise_for_status()
-        with open('/mnt/data/p2-etf-deepm-data/data/master.parquet', 'wb') as f:
+        with open('data/p2-etf-deepm-data/master.parquet', 'wb') as f:
             f.write(r.content)
-        print(f'Downloaded: {len(r.content)} bytes')
+        print(f'Downloaded: {len(r.content)} bytes to data/p2-etf-deepm-data/master.parquet')
         "
     
     - name: Verify data
       run: |
-        ls -lh /mnt/data/p2-etf-deepm-data/data/
+        ls -lh data/p2-etf-deepm-data/
         python -c "
         import pandas as pd
-        df = pd.read_parquet('/mnt/data/p2-etf-deepm-data/data/master.parquet')
+        df = pd.read_parquet('data/p2-etf-deepm-data/master.parquet')
         print(f'Rows: {len(df)}')
         print(f'Columns: {list(df.columns)[:10]}...')
-        print(f'ETFs: {df.get(\\\"symbol\\\", df.get(\\\"etf\\\", df.iloc[:,0])).nunique()}')
+        print(f'ETFs: {df[\\\"symbol\\\"].nunique() if \\\"symbol\\\" in df.columns else \\\"check columns\\\"}')
+        "
+    
+    - name: Update config for local data path
+      run: |
+        python -c "
+        import yaml
+        with open('config.yaml', 'r') as f:
+            config = yaml.safe_load(f)
+        config['data']['local_path'] = 'data/p2-etf-deepm-data'
+        with open('config.yaml', 'w') as f:
+            yaml.dump(config, f)
+        print('Updated config.local_path to data/p2-etf-deepm-data')
         "
     
     - name: Train model
@@ -67,24 +76,17 @@ jobs:
         echo "Generating signals at $(date)"
         python generate_signals.py
     
-    - name: Upload model artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: koopman-model-${{ github.run_id }}
-        path: |
-          koopman_spectral_*.pt
-          training_history.json
-    
-    - name: Upload signals
-      uses: actions/upload-artifact@v4
-      with:
-        name: koopman-signals-${{ github.run_id }}
-        path: signals/
-    
-    - name: Commit signals to repo (optional)
+    - name: Upload all results to HF Hub
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
       run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add signals/
-        git commit -m "Update Koopman signals $(date +%Y-%m-%d)" || echo "No changes"
-        git push || echo "Push failed"
+        echo "Uploading results to HF: P2SAMAPA/p2-etf-koopman-spectral-results"
+        python hf_results_uploader.py
+    
+    - name: Summary
+      run: |
+        echo "=== Run Complete ==="
+        echo "Results uploaded to: https://huggingface.co/datasets/P2SAMAPA/p2-etf-koopman-spectral-results"
+        if [ -f hf_upload_manifest.json ]; then
+          cat hf_upload_manifest.json
+        fi
