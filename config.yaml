@@ -7,7 +7,8 @@ data:
   hf_file: "data/master.parquet"  # Path within repo
   
   # Local fallback path (GitHub Actions / local dev)
-  local_path: "/mnt/data/p2-etf-deepm-data"
+  # Use relative path for compatibility with GitHub Actions runners
+  local_path: "data/p2-etf-deepm-data"
   
   # ETF universe (must match symbols in master.parquet)
   etf_universe: ["SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLRE", "XLB", 
