@@ -504,7 +504,7 @@ def render_full_ranking(signals: Dict):
     # Show as styled table - FIXED: applymap -> map
     st.dataframe(
         df_display.style
-        .map(color_return, subset=['predicted_1d_return'])  # ✅ FIXED HERE
+        .map(color_return, subset=['predicted_1d_return'])
         .background_gradient(subset=['predictability_index'], cmap='RdYlGn', vmin=0, vmax=1)
         .format({
             'predicted_1d_return': '{:+.1f} bps',
@@ -729,22 +729,6 @@ def render_sidebar():
         if st.button("🔄 Refresh Signals", type="primary"):
             st.cache_data.clear()
             st.rerun()
-        
-        st.markdown("---")
-        st.markdown("### 🎯 Objective Settings")
-        
-        st.selectbox(
-            "Optimization Target",
-            ["Maximum Predicted Return", "Risk-Adjusted Return", "Predictability-Weighted"],
-            index=0,
-            disabled=True  # Fixed for this engine variant
-        )
-        
-        st.slider(
-            "Predictability Filter",
-            min_value=0.0, max_value=1.0, value=0.6, step=0.05,
-            disabled=True  # Fixed threshold
-        )
         
         st.markdown("---")
         st.markdown("### 📊 Engine Status")
