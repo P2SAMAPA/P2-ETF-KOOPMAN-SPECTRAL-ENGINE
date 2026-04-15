@@ -35,10 +35,9 @@ def compute_predictability_index(eigenvalues: torch.Tensor) -> float:
     Higher when eigenvalues are clustered near unit circle (oscillatory/stable).
     """
     mags = torch.abs(eigenvalues)
-    # Predictability = 1 - variance of log magnitudes (normalized)
     log_mags = torch.log(mags + 1e-8)
     variance = torch.var(log_mags)
-    predictability = 1.0 / (1.0 + variance)  # Inversely related to variance
+    predictability = 1.0 / (1.0 + variance)
     return float(predictability)
 
 
@@ -114,13 +113,12 @@ def generate_signals(config) -> Dict:
         
         # Predict next return
         with torch.no_grad():
-            # Encode last observable
             last_obs = X_tensor[0, -1, :]  # [2]
             z_last = model.encoder(last_obs.unsqueeze(0))  # [1, obs_dim]
-            pred_return = model(z_last).item()  # scalar (bps? convert)
+            pred_return = model(z_last).item()  # log return (e.g., 0.001 = 10 bps)
         
-        # Convert to basis points (percentage * 100)
-        pred_return_bps = pred_return * 10000  # Assuming log return ~0.0001 per 1bp
+        # Convert to basis points (log return * 10000)
+        pred_return_bps = pred_return * 10000
         
         # Compute predictability from model eigenvalues
         with torch.no_grad():
@@ -131,8 +129,11 @@ def generate_signals(config) -> Dict:
         predictions.append({
             'etf': etf,
             'predicted_1d_return_bps': pred_return_bps,
+            'predicted_1d_return': pred_return_bps,   # ← for ranking table
             'predictability_index': predictability,
-            'regime': regime
+            'koopman_regime': regime,
+            'is_predictable': predictability >= config['signals']['predictability_threshold'],
+            'data_quality': 1.0  # placeholder
         })
     
     # Filter by predictability threshold and sort by predicted return
@@ -143,11 +144,10 @@ def generate_signals(config) -> Dict:
     # Take top 3
     top3 = filtered[:3]
     if len(top3) == 0:
-        # Fallback: use top 3 regardless of predictability
         predictions.sort(key=lambda x: x['predicted_1d_return_bps'], reverse=True)
         top3 = predictions[:3]
     
-    # Build output structure
+    # Build output structure matching the Streamlit app's expectations
     signals = {
         "engine": "KOOPMAN-SPECTRAL",
         "version": "1.0.0",
@@ -163,7 +163,7 @@ def generate_signals(config) -> Dict:
             "predicted_1d_return_bps": round(top3[0]['predicted_1d_return_bps'], 1),
             "predicted_1d_return_pct": round(top3[0]['predicted_1d_return_bps'] / 100, 3),
             "predictability_index": round(top3[0]['predictability_index'], 3),
-            "regime": top3[0]['regime']
+            "regime": top3[0]['koopman_regime']
         },
         "runner_up_picks": [
             {
@@ -172,19 +172,19 @@ def generate_signals(config) -> Dict:
                 "predicted_1d_return_bps": round(p['predicted_1d_return_bps'], 1),
                 "predicted_1d_return_pct": round(p['predicted_1d_return_bps'] / 100, 3),
                 "predictability_index": round(p['predictability_index'], 3),
-                "regime": p['regime']
+                "regime": p['koopman_regime']
             }
             for i, p in enumerate(top3[1:3])
         ],
         "koopman_modes": {
-            "regime": top3[0]['regime'],
+            "regime": top3[0]['koopman_regime'],
             "predictability_index": round(top3[0]['predictability_index'], 3),
-            "growth_modes": 0,  # Would need mode classification from eigenvalues
+            "growth_modes": 0,
             "oscillatory_modes": 0,
             "decay_modes": 0,
             "dominant_frequency_cycles": 0.0
         },
-        "all_etfs": predictions,
+        "all_etfs": predictions,   # contains 'predicted_1d_return' for ranking table
         "metadata": {
             "total_etfs_analyzed": len(predictions),
             "predictable_etfs": len(filtered),
@@ -218,7 +218,7 @@ def main():
         print(f"Signals saved to {output_file}")
         print(f"Top pick: {signals['primary_pick']['etf']} with {signals['primary_pick']['predicted_1d_return_bps']:.1f} bps")
         
-        # Optionally upload to HuggingFace (if configured)
+        # Optionally upload to HuggingFace
         if config.get('github_actions', {}).get('upload_hf', False):
             from hf_results_uploader import upload_signals
             upload_signals(output_file)
