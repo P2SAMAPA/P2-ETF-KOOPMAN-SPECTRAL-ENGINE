@@ -24,7 +24,7 @@ data:
     "DTB3",
     "HY_SPREAD"
   ]
-  train_start: "2008-01-01"
+  train_start: "2009-01-01"
   train_end: "2025-12-31"
   val_days: 252
   lookback_window: 63
