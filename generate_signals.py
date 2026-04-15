@@ -80,7 +80,7 @@ def generate_signals(config) -> Dict:
     predictions = []
     
     for etf in etf_universe:
-        df = loader.get_etf_data(etf)
+        df = loader.get_etf_data(etf, lookback=None)  # full history
         if df is None or len(df) < lookback + 1:
             continue
         
@@ -110,7 +110,7 @@ def generate_signals(config) -> Dict:
         
         with torch.no_grad():
             last_obs = X_tensor[0, -1, :]  # [features]
-            z = model.encode(last_obs.unsqueeze(0))
+            z = model.encoder(last_obs.unsqueeze(0))  # FIXED: use model.encoder
             pred_return = model(z).item()
         
         pred_return_bps = pred_return * 10000  # log return to bps
