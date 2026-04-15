@@ -487,7 +487,7 @@ def render_full_ranking(signals: Dict):
     # Show as styled table
     st.dataframe(
         df_display.style
-        .applymap(color_return, subset=['predicted_1d_return'])
+        .map(color_return, subset=['predicted_1d_return'])  # ✅ FIXED: applymap -> map
         .background_gradient(subset=['predictability_index'], cmap='RdYlGn', vmin=0, vmax=1)
         .format({
             'predicted_1d_return': '{:+.1f} bps',
