@@ -310,8 +310,9 @@ def build_dataset_tensors(config, split='train') -> Tuple[Optional[np.ndarray], 
         etf_dates = df['date'].iloc[valid].reset_index(drop=True)
         merged = pd.DataFrame({'date': etf_dates, 'returns': returns, 'vol': vol})
         merged = merged.merge(macro_df, on='date', how='left')
+        # Forward fill missing macro values (use ffill instead of fillna(method='ffill'))
         for col in macro_cols:
-            merged[col] = merged[col].fillna(method='ffill').fillna(0.0)
+            merged[col] = merged[col].ffill().fillna(0.0)
         
         returns = merged['returns'].values
         vol = merged['vol'].values
