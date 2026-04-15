@@ -174,6 +174,7 @@ def load_config(config_path: str = "config.yaml"):
 def build_dataset(config, split='train'):
     """
     Build dataset from wide-format master.parquet.
+    Returns list of dicts (original format).
     """
     etfs = config['data']['etf_universe']
     lookback = config['data']['lookback_window']
@@ -248,6 +249,85 @@ def build_dataset(config, split='train'):
         return all_samples[split_idx:]
 
 
+def build_dataset_tensors(config, split='train'):
+    """
+    Build dataset as PyTorch tensors for training.
+    Returns:
+        X_tensor: [N, lookback, features]  (returns + volatility)
+        y_tensor: [N, target_horizon]  (future returns)
+        feature_names: list of feature names used
+    """
+    import torch
+    
+    etfs = config['data']['etf_universe']
+    lookback = config['data']['lookback_window']
+    target_horizon = config['data'].get('target_horizon', 5)
+    
+    loader = HFDataLoader(
+        use_local=True, 
+        local_path=config['data'].get('local_path', 'data/p2-etf-deepm-data')
+    )
+    master = loader.load_master()
+    if master.empty:
+        raise ValueError("Could not load master.parquet")
+    
+    all_X = []
+    all_y = []
+    
+    for etf in etfs:
+        df = loader.get_etf_data(etf, lookback=lookback + target_horizon + 5)
+        if df is None or len(df) < lookback + target_horizon:
+            continue
+        
+        # Use log_returns if available
+        if 'log_returns' in df.columns:
+            returns = df['log_returns'].values
+        elif 'returns' in df.columns:
+            returns = df['returns'].values
+        else:
+            continue
+        
+        # Compute rolling volatility (5-day)
+        vol = pd.Series(returns).rolling(5).std().values
+        
+        # Combine features: [returns, vol]
+        # Remove NaNs
+        valid = ~(np.isnan(returns) | np.isnan(vol))
+        returns = returns[valid]
+        vol = vol[valid]
+        if len(returns) < lookback + target_horizon:
+            continue
+        
+        # Create sliding windows
+        for i in range(len(returns) - lookback - target_horizon + 1):
+            X_seq = np.column_stack([
+                returns[i:i+lookback],
+                vol[i:i+lookback]
+            ])  # shape [lookback, 2]
+            y_seq = returns[i+lookback:i+lookback+target_horizon]  # shape [target_horizon]
+            all_X.append(X_seq)
+            all_y.append(y_seq)
+    
+    if len(all_X) == 0:
+        return None, None, None
+    
+    # Split into train/val based on time order (chronological)
+    split_idx = int(len(all_X) * 0.8)
+    if split == 'train':
+        X = all_X[:split_idx]
+        y = all_y[:split_idx]
+    else:
+        X = all_X[split_idx:]
+        y = all_y[split_idx:]
+    
+    # Convert to tensors
+    X_tensor = torch.tensor(np.array(X), dtype=torch.float32)
+    y_tensor = torch.tensor(np.array(y), dtype=torch.float32)
+    
+    feature_names = ['returns', 'volatility']
+    return X_tensor, y_tensor, feature_names
+
+
 if __name__ == "__main__":
     try:
         config = load_config()
@@ -275,6 +355,11 @@ if __name__ == "__main__":
             else:
                 print(f"\nWARNING: No data for {test_etf}")
                 print(f"Available: {loader.get_all_etfs()[:10]}...")
+                
+            # Test tensor builder
+            X_train, y_train, feats = build_dataset_tensors(config, 'train')
+            if X_train is not None:
+                print(f"\nTensor dataset: X_train shape {X_train.shape}, y_train shape {y_train.shape}")
                 
     except Exception as e:
         print(f"Error: {e}")
