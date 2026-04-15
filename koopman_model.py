@@ -21,26 +21,33 @@ class DMDBaseline:
         Args:
             observables: [N, K]  (N samples, K observables)
             observables_next: [N, K]
-            rank: truncation rank
+            rank: truncation rank (must be <= K)
         
         Returns:
             K: [rank, rank] torch float tensor
         """
-        # SVD of observables
+        # Ensure rank is not larger than observable dimension
+        rank = min(rank, observables.shape[1])
+        
+        # Compute SVD of observables
         U, s, Vh = np.linalg.svd(observables, full_matrices=False)
-        U_r = U[:, :rank]
+        # U: [N, N], Vh: [K, K]
+        
+        # Truncate to rank
+        U_r = U[:, :rank]        # [N, rank]
+        Vh_r = Vh[:rank, :]      # [rank, K]
         s_r = s[:rank]
         
-        # Project to rank-r space
-        observables_proj = observables @ U_r  # [N, rank]
-        observables_next_proj = observables_next @ U_r
+        # Project data onto rank-r subspace
+        # Instead of using U_r, we use Vh_r for projection: observables_proj = observables @ Vh_r.T
+        observables_proj = observables @ Vh_r.T   # [N, rank]
+        observables_next_proj = observables_next @ Vh_r.T
         
-        # Least squares for K_proj: observables_next_proj ≈ observables_proj @ K_proj.T
-        K_proj, _, _, _ = lstsq(observables_proj, observables_next_proj)
-        K_proj = K_proj.T  # [rank, rank]
+        # Compute reduced Koopman matrix K_r = observables_proj \ observables_next_proj
+        K_r, _, _, _ = lstsq(observables_proj, observables_next_proj)
+        K_r = K_r.T  # [rank, rank]
         
-        # Transform back to original basis if needed? Not necessary; we'll use K_proj directly.
-        return torch.tensor(K_proj, dtype=torch.float32)
+        return torch.tensor(K_r, dtype=torch.float32)
 
 
 class MLPEncoder(nn.Module):
@@ -73,15 +80,13 @@ class KoopmanSpectral(nn.Module):
         super().__init__()
         
         self.obs_dim = config['model']['observable_dim']
-        # Input dimension: number of features per timestep (e.g., returns + volatility)
-        # This should be set in config or inferred from data. We'll read from config.
-        self.input_dim = config['model'].get('input_dim', 2)  # default: returns and vol
+        self.input_dim = config['model'].get('input_dim', 2)
         hidden_dims = config['model']['encoder_hidden']
         dropout = config['model'].get('dropout', 0.1)
         
         self.encoder = MLPEncoder(self.input_dim, self.obs_dim, hidden_dims, dropout)
         
-        # Learnable Koopman operator (will be initialized via DMD)
+        # Learnable Koopman operator (will be initialized via DMD if enabled)
         self.K = nn.Parameter(torch.eye(self.obs_dim) * 0.01)
         
         # Readout: observables -> 1-day return prediction
@@ -95,9 +100,7 @@ class KoopmanSpectral(nn.Module):
     def initialize_with_dmd(self, dmd_K: torch.Tensor):
         """Warm start the Koopman matrix from DMD solution."""
         with torch.no_grad():
-            # Ensure dimensions match
             if dmd_K.shape != self.K.shape:
-                # Pad or truncate
                 min_rows = min(dmd_K.shape[0], self.K.shape[0])
                 min_cols = min(dmd_K.shape[1], self.K.shape[1])
                 self.K[:min_rows, :min_cols] = dmd_K[:min_rows, :min_cols]
@@ -110,7 +113,6 @@ class KoopmanSpectral(nn.Module):
         z: [batch, obs_dim]
         Returns: next_return [batch, 1]
         """
-        # Linear dynamics: z_next = z @ K.T
         z_next = z @ self.K.T
         r_next = self.readout(z_next)
         return r_next
@@ -121,30 +123,28 @@ class KoopmanSpectral(nn.Module):
         X: [batch, lookback, features]
         y: [batch, target_horizon] (returns)
         """
-        # Encode all timesteps
         batch_size, T, D = X.shape
         flat = X.view(-1, D)
-        z_all = self.encoder(flat).view(batch_size, T, -1)  # [batch, T, obs_dim]
+        z_all = self.encoder(flat).view(batch_size, T, -1)
         
-        # Linearity loss: z[t+1] ≈ z[t] @ K.T
+        # Linearity loss
         z_in = z_all[:, :-1, :].reshape(-1, self.obs_dim)
         z_out = z_all[:, 1:, :].reshape(-1, self.obs_dim)
         z_pred = z_in @ self.K.T
         linearity_loss = nn.MSELoss()(z_pred, z_out)
         
-        # Prediction loss: from last observable to next return
+        # Prediction loss
         z_last = z_all[:, -1, :]
-        pred_returns = self.forward(z_last)  # [batch, 1]
-        target = y[:, 0:1]  # next day return
+        pred_returns = self.forward(z_last)
+        target = y[:, 0:1]
         pred_loss = nn.MSELoss()(pred_returns, target)
         
-        # Spectral penalty: encourage eigenvalues within unit circle
+        # Spectral penalty
         with torch.no_grad():
             eigs = torch.linalg.eigvals(self.K)
             max_mag = torch.abs(eigs).max()
         spectral_penalty = torch.relu(max_mag - 1.2) ** 2
         
-        # Weighted sum
         total_loss = (config['model']['prediction_weight'] * pred_loss +
                       config['model']['linearity_weight'] * linearity_loss +
                       config['model']['spectral_weight'] * spectral_penalty)
