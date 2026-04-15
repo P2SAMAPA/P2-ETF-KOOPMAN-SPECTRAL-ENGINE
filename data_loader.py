@@ -1,6 +1,6 @@
 """
 Data loader for Koopman-Spectral engine.
-Handles wide-format parquet: columns = ['Date', 'ETF1_Open', 'ETF1_High', ..., 'ETF2_Open', ...]
+Handles wide-format parquet + macro indicators.
 Source: HF dataset P2SAMAPA/p2-etf-deepm-data/data/master.parquet
 """
 
@@ -10,14 +10,14 @@ from pathlib import Path
 import yaml
 import requests
 from io import BytesIO
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import re
 
 
 class HFDataLoader:
     """
     HuggingFace dataset loader for p2-etf-deepm-data.
-    Handles wide-format parquet with ETF-specific columns.
+    Handles wide-format parquet with ETF-specific columns and macro indicators.
     """
     
     HF_DATASET_NAME = "P2SAMAPA/p2-etf-deepm-data"
@@ -32,7 +32,6 @@ class HFDataLoader:
         self._date_col = None
         
     def _load_master_from_hf(self) -> pd.DataFrame:
-        """Load master.parquet from HuggingFace Hub."""
         url = f"{self.BASE_URL}/master.parquet"
         try:
             response = requests.get(url, timeout=60)
@@ -45,7 +44,6 @@ class HFDataLoader:
             return pd.DataFrame()
     
     def _load_master_local(self) -> pd.DataFrame:
-        """Load from local path."""
         filepath = self.local_path / "master.parquet"
         if not filepath.exists():
             filepath = self.local_path / "data" / "master.parquet"
@@ -60,13 +58,10 @@ class HFDataLoader:
             return pd.DataFrame()
     
     def _process_columns(self, df: pd.DataFrame):
-        """Parse wide-format columns to extract ETF names."""
         self._columns = df.columns.tolist()
-        # Find date column
         date_cols = [c for c in self._columns if c.lower() in ['date', 'timestamp', 'time']]
         self._date_col = date_cols[0] if date_cols else self._columns[0]
         
-        # Parse ETF names from column names like "ETF_Open", "ETF_High", etc.
         self._etf_columns_map = {}
         pattern = re.compile(r'^(.*?)(?:_Open|_High|_Low|_Close|_Volume|_AdjClose|_Returns|_LogReturns)$')
         for col in self._columns:
@@ -80,7 +75,6 @@ class HFDataLoader:
         print(f"Total ETFs: {len(self._etf_columns_map)}")
     
     def load_master(self) -> pd.DataFrame:
-        """Load consolidated master dataset."""
         if self._master_df is not None:
             return self._master_df
         if self.use_local:
@@ -103,12 +97,7 @@ class HFDataLoader:
         return list(self._etf_columns_map.keys()) if self._etf_columns_map else []
     
     def get_etf_data(self, symbol: str) -> Optional[pd.DataFrame]:
-        """
-        Extract FULL time series for a single ETF from wide-format dataset.
-        Returns DataFrame with columns: date, open, high, low, close, volume,
-        returns, log_returns, symbol. Returns None if symbol not found.
-        This version returns the entire history (no truncation).
-        """
+        """Return full time series for one ETF (date, close, returns, log_returns)."""
         master = self.load_master()
         if master.empty:
             return None
@@ -120,30 +109,37 @@ class HFDataLoader:
         df = pd.DataFrame()
         df['date'] = pd.to_datetime(master[self._date_col])
         
-        # Map to standard OHLCV names
         col_mapping = {}
         for col in etf_cols:
             col_lower = col.lower()
-            if '_open' in col_lower:
-                col_mapping['open'] = col
-            elif '_high' in col_lower:
-                col_mapping['high'] = col
-            elif '_low' in col_lower:
-                col_mapping['low'] = col
-            elif '_close' in col_lower:
+            if '_close' in col_lower:
                 col_mapping['close'] = col
-            elif '_volume' in col_lower:
-                col_mapping['volume'] = col
+        if 'close' not in col_mapping:
+            return None
         
-        for std_name, orig_col in col_mapping.items():
-            df[std_name] = master[orig_col]
-        
-        # Calculate returns if not present
-        if 'close' in df.columns:
-            df['returns'] = df['close'].pct_change()
-            df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
-        
+        df['close'] = master[col_mapping['close']]
+        df['returns'] = df['close'].pct_change()
+        df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
         df['symbol'] = symbol
+        df = df.sort_values('date').dropna().reset_index(drop=True)
+        return df
+    
+    def get_macro_data(self, macro_cols: List[str]) -> pd.DataFrame:
+        """Extract macro indicator columns from master."""
+        master = self.load_master()
+        if master.empty:
+            return pd.DataFrame()
+        available = [c for c in macro_cols if c in master.columns]
+        missing = set(macro_cols) - set(available)
+        if missing:
+            print(f"Warning: Missing macro columns: {missing}")
+        if not available:
+            print("No macro columns found. Returning empty DataFrame.")
+            return pd.DataFrame()
+        df = pd.DataFrame()
+        df['date'] = pd.to_datetime(master[self._date_col])
+        for col in available:
+            df[col] = master[col]
         df = df.sort_values('date').dropna().reset_index(drop=True)
         return df
 
@@ -153,73 +149,21 @@ def load_config(config_path: str = "config.yaml"):
         return yaml.safe_load(f)
 
 
-def build_dataset(config, split='train'):
+def build_dataset_tensors(config, split='train') -> Tuple[Optional[np.ndarray], Optional[np.ndarray], List[str]]:
     """
-    Legacy function: returns list of dicts (kept for compatibility).
-    """
-    etfs = config['data']['etf_universe']
-    lookback = config['data']['lookback_window']
-    target_horizon = config['data'].get('target_horizon', 5)
-    loader = HFDataLoader(
-        use_local=True,
-        local_path=config['data'].get('local_path', 'data/p2-etf-deepm-data')
-    )
-    master = loader.load_master()
-    if master.empty:
-        raise ValueError("Could not load master.parquet")
-    
-    all_samples = []
-    for etf in etfs:
-        df = loader.get_etf_data(etf)
-        if df is None or len(df) < lookback + target_horizon:
-            continue
-        if 'log_returns' in df.columns:
-            returns_col = 'log_returns'
-        elif 'returns' in df.columns:
-            returns_col = 'returns'
-        else:
-            continue
-        
-        df['vol'] = df[returns_col].rolling(5).std()
-        features = [returns_col, 'vol']
-        feature_df = df[features].dropna()
-        if len(feature_df) < lookback + target_horizon:
-            continue
-        data = feature_df.values
-        for i in range(len(data) - lookback - target_horizon):
-            x = data[i:i+lookback]
-            y = data[i+lookback:i+lookback+target_horizon, 0]  # only returns target
-            if np.isnan(x).any() or np.isnan(y).any():
-                continue
-            all_samples.append({
-                'etf': etf,
-                'X': x,
-                'Y': y,
-                'timestamp': df['date'].iloc[i+lookback],
-                'features': features
-            })
-    if len(all_samples) == 0:
-        raise ValueError("No training samples generated")
-    split_idx = int(len(all_samples) * 0.8)
-    if split == 'train':
-        return all_samples[:split_idx]
-    else:
-        return all_samples[split_idx:]
-
-
-def build_dataset_tensors(config, split='train'):
-    """
-    Build dataset as PyTorch tensors for training.
-    Uses FULL historical data for each ETF, creating sliding windows.
+    Build dataset with ETF returns + volatility + all macro features.
     Returns:
-        X_tensor: [N, lookback, 2] (returns + volatility)
-        y_tensor: [N, target_horizon] (future returns)
+        X: [N, lookback, features] (features = returns, vol, macro1, macro2, ...)
+        y: [N, target_horizon] (future returns)
         feature_names: list
     """
     import torch
-    etfs = config['data']['etf_universe']
+    
     lookback = config['data']['lookback_window']
     target_horizon = config['data'].get('target_horizon', 5)
+    etf_universe = config['data']['etf_universe']
+    macro_cols = config['data']['macro_features']
+    
     loader = HFDataLoader(
         use_local=True,
         local_path=config['data'].get('local_path', 'data/p2-etf-deepm-data')
@@ -228,42 +172,61 @@ def build_dataset_tensors(config, split='train'):
     if master.empty:
         raise ValueError("Could not load master.parquet")
     
+    # Load macro data
+    macro_df = loader.get_macro_data(macro_cols)
+    if macro_df.empty:
+        print("Warning: No macro data found. Using zeros for macro features.")
+        # Create dummy macro with zeros (same date range as master)
+        macro_df = pd.DataFrame({'date': master[loader._date_col]})
+        for col in macro_cols:
+            macro_df[col] = 0.0
+        macro_df = macro_df.dropna().reset_index(drop=True)
+    
     all_X = []
     all_y = []
-    for etf in etfs:
-        df = loader.get_etf_data(etf)  # returns full history
+    
+    for etf in etf_universe:
+        df = loader.get_etf_data(etf)
         if df is None or len(df) < lookback + target_horizon:
             continue
-        if 'log_returns' in df.columns:
-            returns = df['log_returns'].values
-        elif 'returns' in df.columns:
-            returns = df['returns'].values
-        else:
-            continue
         
-        # Compute rolling volatility (5-day)
+        # Use log returns
+        returns = df['log_returns'].values
+        # Compute volatility (5-day rolling)
         vol = pd.Series(returns).rolling(5).std().values
-        # Remove NaNs from both series
-        valid = ~(np.isnan(returns) | np.isnan(vol))
+        # Remove initial NaNs from vol
+        valid = ~np.isnan(vol)
         returns = returns[valid]
         vol = vol[valid]
         if len(returns) < lookback + target_horizon:
             continue
         
-        # Create sliding windows over the entire series
+        # Align macro data by date
+        etf_dates = df['date'].iloc[valid].reset_index(drop=True)
+        merged = pd.DataFrame({'date': etf_dates, 'returns': returns, 'vol': vol})
+        merged = merged.merge(macro_df, on='date', how='left')
+        # Forward fill missing macro values
+        for col in macro_cols:
+            merged[col] = merged[col].fillna(method='ffill').fillna(0.0)
+        
+        returns = merged['returns'].values
+        vol = merged['vol'].values
+        macro_vals = merged[macro_cols].values  # shape [T, M]
+        
+        # Create sliding windows
         for i in range(len(returns) - lookback - target_horizon + 1):
-            X_seq = np.column_stack([
-                returns[i:i+lookback],
-                vol[i:i+lookback]
-            ])  # shape [lookback, 2]
-            y_seq = returns[i+lookback:i+lookback+target_horizon]  # shape [target_horizon]
+            ret_window = returns[i:i+lookback].reshape(-1, 1)
+            vol_window = vol[i:i+lookback].reshape(-1, 1)
+            macro_window = macro_vals[i:i+lookback, :]  # [lookback, M]
+            X_seq = np.hstack([ret_window, vol_window, macro_window])  # [lookback, 2+M]
+            y_seq = returns[i+lookback:i+lookback+target_horizon]
             all_X.append(X_seq)
             all_y.append(y_seq)
     
     if len(all_X) == 0:
         return None, None, None
     
-    # Chronological split (80/20)
+    # Split chronologically
     split_idx = int(len(all_X) * 0.8)
     if split == 'train':
         X = all_X[:split_idx]
@@ -274,43 +237,16 @@ def build_dataset_tensors(config, split='train'):
     
     X_tensor = torch.tensor(np.array(X), dtype=torch.float32)
     y_tensor = torch.tensor(np.array(y), dtype=torch.float32)
-    feature_names = ['returns', 'volatility']
+    feature_names = ['returns', 'volatility'] + macro_cols
     return X_tensor, y_tensor, feature_names
 
 
 if __name__ == "__main__":
-    try:
-        config = load_config()
-        print(f"Loading data from: {config['data'].get('local_path', 'data/p2-etf-deepm-data')}")
-        loader = HFDataLoader(
-            use_local=True,
-            local_path=config['data'].get('local_path', 'data/p2-etf-deepm-data')
-        )
-        master = loader.load_master()
-        if master.empty:
-            print("ERROR: Could not load master.parquet")
-        else:
-            print(f"Loaded: {len(master)} rows, {len(loader.get_columns())} columns")
-            print(f"ETFs detected: {len(loader.get_all_etfs())}")
-            print(f"Sample ETFs: {loader.get_all_etfs()[:10]}")
-            
-            # Check full data length for first ETF
-            test_etf = config['data']['etf_universe'][0]
-            test_data = loader.get_etf_data(test_etf)
-            if test_data is not None:
-                print(f"\nFull data for {test_etf}: {len(test_data)} rows")
-                print(test_data[['date', 'close', 'log_returns']].head())
-            else:
-                print(f"\nWARNING: No data for {test_etf}")
-            
-            # Check sample counts from tensor builder
-            X_train, y_train, _ = build_dataset_tensors(config, 'train')
-            if X_train is not None:
-                print(f"\nTrain samples: {X_train.shape[0]}")
-                X_val, y_val, _ = build_dataset_tensors(config, 'val')
-                if X_val is not None:
-                    print(f"Val samples: {X_val.shape[0]}")
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+    config = load_config()
+    print("Testing data loader with all macro features...")
+    X_train, y_train, feat_names = build_dataset_tensors(config, 'train')
+    if X_train is not None:
+        print(f"Train samples: {X_train.shape[0]}, features: {X_train.shape[-1]} -> {feat_names}")
+        print(f"Example X[0, -1, :]: {X_train[0, -1, :]}")
+    else:
+        print("No data generated.")
