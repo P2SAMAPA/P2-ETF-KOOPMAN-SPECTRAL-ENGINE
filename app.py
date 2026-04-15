@@ -373,7 +373,7 @@ def render_header():
 def render_hero_top3(signals: Dict):
     """
     Render hero card with TOP 3 ETFs by predicted return.
-    Uses Streamlit columns for proper rendering instead of raw HTML flexbox.
+    Uses Streamlit columns for proper rendering.
     """
     st.markdown("---")
     
@@ -504,7 +504,7 @@ def render_full_ranking(signals: Dict):
     # Show as styled table - FIXED: applymap -> map
     st.dataframe(
         df_display.style
-        .map(color_return, subset=['predicted_1d_return'])
+        .map(color_return, subset=['predicted_1d_return'])  # ✅ FIXED HERE
         .background_gradient(subset=['predictability_index'], cmap='RdYlGn', vmin=0, vmax=1)
         .format({
             'predicted_1d_return': '{:+.1f} bps',
@@ -816,4 +816,24 @@ def main():
     st.caption(f"Source: {source} | Loaded: {loaded_at}")
     
     # Main content tabs
-    tab1, tab2, tab3 = st.tabs
+    tab1, tab2, tab3 = st.tabs([
+        "🎯 Top 3 Signals", 
+        "📊 Full Ranking",
+        "🔬 Analysis"
+    ])
+    
+    with tab1:
+        render_hero_top3(signals)
+        render_data_source_info(signals)
+    
+    with tab2:
+        render_full_ranking(signals)
+    
+    with tab3:
+        render_koopman_analysis(signals)
+    
+    render_footer()
+
+
+if __name__ == "__main__":
+    main()
