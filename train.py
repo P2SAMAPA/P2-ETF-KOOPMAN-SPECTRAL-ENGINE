@@ -1,5 +1,6 @@
 """
-Training script for Koopman-Spectral engine with all macro features.
+Training script for Koopman-Spectral engine with GRU sequence encoder.
+Target returns are scaled to improve sensitivity.
 """
 
 import torch
@@ -18,7 +19,7 @@ def main():
     print(f"=== Koopman-Spectral Training Started {datetime.now()} ===")
     config = load_config()
     
-    # Compute input dimension: returns + vol + number of macro features
+    # Compute input dimension
     num_macro = len(config['data']['macro_features'])
     config['model']['input_dim'] = 2 + num_macro
     print(f"Input dimension: {config['model']['input_dim']} (returns + vol + {num_macro} macro features)")
@@ -31,13 +32,19 @@ def main():
         print("ERROR: No training data available.")
         return
     
+    # Scale target returns (multiply by 100) to make loss more sensitive
+    scale_factor = 100.0
+    y_train_scaled = y_train * scale_factor
+    y_val_scaled = y_val * scale_factor
+    
     print(f"Train samples: {len(X_train)}, Val samples: {len(X_val)}")
     print(f"Input features: {feat_names}")
     print(f"Input shape: {X_train.shape[1:]} (lookback, features)")
+    print(f"Target scaling factor: {scale_factor}")
     
     # DataLoaders
-    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=config['training']['batch_size'], shuffle=True)
-    val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=config['training']['batch_size'], shuffle=False)
+    train_loader = DataLoader(TensorDataset(X_train, y_train_scaled), batch_size=config['training']['batch_size'], shuffle=True)
+    val_loader = DataLoader(TensorDataset(X_val, y_val_scaled), batch_size=config['training']['batch_size'], shuffle=False)
     
     model = KoopmanSpectral(config)
     optimizer = optim.Adam(model.parameters(), lr=config['training']['learning_rate'])
@@ -53,10 +60,8 @@ def main():
         train_loss = 0.0
         for X_batch, y_batch in train_loader:
             # X_batch: [batch, lookback, features]
-            last_obs = X_batch[:, -1, :]  # [batch, features]
-            z = model.encoder(last_obs)   # FIXED: use model.encoder
-            pred = model(z)               # [batch, 1]
-            target = y_batch[:, 0:1]      # next day return
+            pred = model(X_batch)  # [batch, 1]
+            target = y_batch[:, 0:1]  # next day scaled return
             loss = criterion(pred, target)
             optimizer.zero_grad()
             loss.backward()
@@ -69,9 +74,7 @@ def main():
         val_loss = 0.0
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
-                last_obs = X_batch[:, -1, :]
-                z = model.encoder(last_obs)
-                pred = model(z)
+                pred = model(X_batch)
                 target = y_batch[:, 0:1]
                 loss = criterion(pred, target)
                 val_loss += loss.item() * X_batch.size(0)
@@ -85,9 +88,11 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
+                'scale_factor': scale_factor,
                 'config': config,
             }, 'koopman_spectral_best.pt')
-            print(f"Epoch {epoch+1}: new best val_loss={val_loss:.6f}")
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch+1}: new best val_loss={val_loss:.6f}")
         else:
             patience_counter += 1
             if patience_counter >= patience:
