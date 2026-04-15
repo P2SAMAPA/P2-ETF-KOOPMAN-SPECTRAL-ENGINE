@@ -26,27 +26,29 @@ data:
   # Window configuration
   lookback_window: 63  # 3 months of daily data per sample
   target_horizon: 5    # 5-day prediction
-  
+
 model:
-  observable_dim: 64        # Koopman observables (K)
-  encoder_hidden: [128, 128] # MLP encoder layers
+  input_dim: 2                     # Number of features per timestep (returns + volatility)
+  observable_dim: 64               # Koopman observables (K)
+  encoder_hidden: [128, 128]       # MLP encoder layers
   encoder_activation: "relu"
-  linearity_weight: 1.0     # Loss weight for linearity constraint
-  prediction_weight: 1.0    # Loss weight for prediction MSE
-  spectral_weight: 0.1      # Loss weight for spectral penalty
-  
+  dropout: 0.1                     # Dropout rate for regularization
+  linearity_weight: 1.0            # Loss weight for linearity constraint
+  prediction_weight: 1.0           # Loss weight for prediction MSE
+  spectral_weight: 0.1             # Loss weight for spectral penalty
+
 training:
   epochs: 500
   batch_size: 32
   learning_rate: 0.001
-  patience: 20              # Early stopping
-  dmd_init: true            # Initialize with Dynamic Mode Decomposition
-  
+  patience: 20                     # Early stopping
+  dmd_init: true                   # Initialize with Dynamic Mode Decomposition
+
 signals:
   output_dir: "signals"
-  predictability_threshold: 0.6  # Minimum predictability to include
-  modes_to_track: 5         # Top K modes to report
+  predictability_threshold: 0.6    # Minimum predictability to include
+  modes_to_track: 5                # Top K modes to report
 
 github_actions:
-  max_runtime_minutes: 300  # 5 hour safety margin
+  max_runtime_minutes: 300          # 5 hour safety margin
   cache_data: true
