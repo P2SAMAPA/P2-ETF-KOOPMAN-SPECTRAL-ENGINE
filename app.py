@@ -133,6 +133,22 @@ st.markdown("""
         border-radius: 10px;
         color: white;
     }
+    .hero-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1.5rem;
+        border-radius: 15px;
+        text-align: center;
+        color: white;
+        height: 100%;
+    }
+    .hero-card-main {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 2rem;
+        border-radius: 15px;
+        text-align: center;
+        color: white;
+        height: 100%;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -357,7 +373,7 @@ def render_header():
 def render_hero_top3(signals: Dict):
     """
     Render hero card with TOP 3 ETFs by predicted return.
-    #1: Large font (5rem), #2-3: Smaller font (2.5rem), side-by-side layout.
+    Uses Streamlit columns for proper rendering instead of raw HTML flexbox.
     """
     st.markdown("---")
     
@@ -381,68 +397,69 @@ def render_hero_top3(signals: Dict):
     </div>
     """, unsafe_allow_html=True)
     
-    # Build hero HTML with top 3
-    hero_html = f"""
-    <div class="hero-container">
-        <div style="display: flex; align-items: center; justify-content: space-around;">
-            
-            <!-- #1 Primary Pick (Large) -->
-            <div style="flex: 2; text-align: center; padding: 1rem;">
-                <div class="hero-label">🥇 Rank #1 · Primary Signal</div>
-                <div class="hero-etf-main">{primary['etf']}</div>
-                <div class="hero-return" style="color: {'#90EE90' if primary['predicted_1d_return_bps'] > 0 else '#FFB6C1'};">
-                    {primary['predicted_1d_return_bps']:+.0f} bps
-                    <span style="font-size: 0.6em; opacity: 0.8;">({primary['predicted_1d_return_pct']:+.3f}%)</span>
-                </div>
-                <div style="margin-top: 0.5rem; font-size: 0.9rem;">
-                    Predictability: {primary['predictability_index']:.2f} · {primary['regime'].upper()}
-                </div>
-            </div>
-    """
+    # Determine number of columns based on available runners
+    num_runners = len(runners)
     
-    # Add runner #2 if exists
-    if len(runners) >= 1:
+    if num_runners >= 2:
+        cols = st.columns([2, 1, 1])
+    elif num_runners >= 1:
+        cols = st.columns([2, 1])
+    else:
+        cols = [st.container()]
+    
+    # Column 0: Primary Pick (Rank #1) - Larger
+    primary_color = '#90EE90' if primary['predicted_1d_return_bps'] > 0 else '#FFB6C1'
+    
+    with cols[0]:
+        st.markdown(f"""
+        <div class="hero-card-main">
+            <div class="hero-label">🥇 Rank #1 · Primary Signal</div>
+            <div class="hero-etf-main">{primary['etf']}</div>
+            <div class="hero-return" style="color: {primary_color};">
+                {primary['predicted_1d_return_bps']:+.0f} bps
+                <span style="font-size: 0.6em; opacity: 0.8;">({primary['predicted_1d_return_pct']:+.3f}%)</span>
+            </div>
+            <div style="margin-top: 0.5rem; font-size: 0.9rem;">
+                Predictability: {primary['predictability_index']:.2f} · {primary['regime'].upper()}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Column 1: Runner #2
+    if num_runners >= 1:
         r = runners[0]
-        color = '#90EE90' if r['predicted_1d_return_bps'] > 0 else '#FFB6C1'
-        hero_html += f"""
-            <div class="hero-divider"></div>
-            
-            <!-- #2 Runner Up -->
-            <div style="flex: 1; text-align: center; padding: 1rem;">
+        runner_color = '#90EE90' if r['predicted_1d_return_bps'] > 0 else '#FFB6C1'
+        with cols[1]:
+            st.markdown(f"""
+            <div class="hero-card">
                 <div class="hero-label">🥈 Rank #2</div>
                 <div class="hero-etf-secondary">{r['etf']}</div>
-                <div class="hero-return" style="font-size: 1.2rem; color: {color};">
+                <div class="hero-return" style="font-size: 1.2rem; color: {runner_color};">
                     {r['predicted_1d_return_bps']:+.0f} bps
                 </div>
                 <div style="font-size: 0.8rem; opacity: 0.9;">
                     {r['regime']} · p={r['predictability_index']:.2f}
                 </div>
             </div>
-        """
+            """, unsafe_allow_html=True)
     
-    # Add runner #3 if exists
-    if len(runners) >= 2:
+    # Column 2: Runner #3 (if exists)
+    if num_runners >= 2:
         r = runners[1]
-        color = '#90EE90' if r['predicted_1d_return_bps'] > 0 else '#FFB6C1'
-        hero_html += f"""
-            <div class="hero-divider"></div>
-            
-            <!-- #3 Third Place -->
-            <div style="flex: 1; text-align: center; padding: 1rem;">
+        runner_color = '#90EE90' if r['predicted_1d_return_bps'] > 0 else '#FFB6C1'
+        with cols[2]:
+            st.markdown(f"""
+            <div class="hero-card">
                 <div class="hero-label">🥉 Rank #3</div>
                 <div class="hero-etf-secondary">{r['etf']}</div>
-                <div class="hero-return" style="font-size: 1.2rem; color: {color};">
+                <div class="hero-return" style="font-size: 1.2rem; color: {runner_color};">
                     {r['predicted_1d_return_bps']:+.0f} bps
                 </div>
                 <div style="font-size: 0.8rem; opacity: 0.9;">
                     {r['regime']} · p={r['predictability_index']:.2f}
                 </div>
             </div>
-        """
-    
-    hero_html += "</div></div>"
-    
-    st.markdown(hero_html, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
     
     # Objective reminder
     st.markdown(f"""
@@ -484,10 +501,10 @@ def render_full_ranking(signals: Dict):
             return f'color: {color}; font-weight: bold'
         return ''
     
-    # Show as styled table
+    # Show as styled table - FIXED: applymap -> map
     st.dataframe(
         df_display.style
-        .map(color_return, subset=['predicted_1d_return'])  # ✅ FIXED: applymap -> map
+        .map(color_return, subset=['predicted_1d_return'])
         .background_gradient(subset=['predictability_index'], cmap='RdYlGn', vmin=0, vmax=1)
         .format({
             'predicted_1d_return': '{:+.1f} bps',
@@ -799,24 +816,4 @@ def main():
     st.caption(f"Source: {source} | Loaded: {loaded_at}")
     
     # Main content tabs
-    tab1, tab2, tab3 = st.tabs([
-        "🎯 Top 3 Signals", 
-        "📊 Full Ranking",
-        "🔬 Analysis"
-    ])
-    
-    with tab1:
-        render_hero_top3(signals)
-        render_data_source_info(signals)
-    
-    with tab2:
-        render_full_ranking(signals)
-    
-    with tab3:
-        render_koopman_analysis(signals)
-    
-    render_footer()
-
-
-if __name__ == "__main__":
-    main()
+    tab1, tab2, tab3 = st.tabs
