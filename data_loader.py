@@ -104,9 +104,10 @@ class HFDataLoader:
     
     def get_etf_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """
-        Extract full time series for a single ETF from wide-format dataset.
+        Extract FULL time series for a single ETF from wide-format dataset.
         Returns DataFrame with columns: date, open, high, low, close, volume,
         returns, log_returns, symbol. Returns None if symbol not found.
+        This version returns the entire history (no truncation).
         """
         master = self.load_master()
         if master.empty:
@@ -209,6 +210,7 @@ def build_dataset(config, split='train'):
 def build_dataset_tensors(config, split='train'):
     """
     Build dataset as PyTorch tensors for training.
+    Uses FULL historical data for each ETF, creating sliding windows.
     Returns:
         X_tensor: [N, lookback, 2] (returns + volatility)
         y_tensor: [N, target_horizon] (future returns)
@@ -229,7 +231,7 @@ def build_dataset_tensors(config, split='train'):
     all_X = []
     all_y = []
     for etf in etfs:
-        df = loader.get_etf_data(etf)  # now returns full history
+        df = loader.get_etf_data(etf)  # returns full history
         if df is None or len(df) < lookback + target_horizon:
             continue
         if 'log_returns' in df.columns:
@@ -248,7 +250,7 @@ def build_dataset_tensors(config, split='train'):
         if len(returns) < lookback + target_horizon:
             continue
         
-        # Sliding windows over the entire series
+        # Create sliding windows over the entire series
         for i in range(len(returns) - lookback - target_horizon + 1):
             X_seq = np.column_stack([
                 returns[i:i+lookback],
@@ -292,7 +294,7 @@ if __name__ == "__main__":
             print(f"ETFs detected: {len(loader.get_all_etfs())}")
             print(f"Sample ETFs: {loader.get_all_etfs()[:10]}")
             
-            # Test with first ETF
+            # Check full data length for first ETF
             test_etf = config['data']['etf_universe'][0]
             test_data = loader.get_etf_data(test_etf)
             if test_data is not None:
@@ -301,10 +303,13 @@ if __name__ == "__main__":
             else:
                 print(f"\nWARNING: No data for {test_etf}")
             
-            # Check sample count
+            # Check sample counts from tensor builder
             X_train, y_train, _ = build_dataset_tensors(config, 'train')
             if X_train is not None:
-                print(f"\nTrain samples: {X_train.shape[0]}, Val samples: ...")
+                print(f"\nTrain samples: {X_train.shape[0]}")
+                X_val, y_val, _ = build_dataset_tensors(config, 'val')
+                if X_val is not None:
+                    print(f"Val samples: {X_val.shape[0]}")
     except Exception as e:
         print(f"Error: {e}")
         import traceback
