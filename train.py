@@ -54,9 +54,9 @@ def main():
         for X_batch, y_batch in train_loader:
             # X_batch: [batch, lookback, features]
             last_obs = X_batch[:, -1, :]  # [batch, features]
-            z = model.encode(last_obs)
-            pred = model(z)  # [batch, 1]
-            target = y_batch[:, 0:1]  # next day return
+            z = model.encoder(last_obs)   # FIXED: use model.encoder
+            pred = model(z)               # [batch, 1]
+            target = y_batch[:, 0:1]      # next day return
             loss = criterion(pred, target)
             optimizer.zero_grad()
             loss.backward()
@@ -70,7 +70,7 @@ def main():
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 last_obs = X_batch[:, -1, :]
-                z = model.encode(last_obs)
+                z = model.encoder(last_obs)
                 pred = model(z)
                 target = y_batch[:, 0:1]
                 loss = criterion(pred, target)
