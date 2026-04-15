@@ -24,14 +24,14 @@ data:
     "DTB3",
     "HY_SPREAD"
   ]
-  train_start: "2009-01-01"
+  train_start: "2008-01-01"
   train_end: "2025-12-31"
   val_days: 252
   lookback_window: 63
   target_horizon: 5
 
 model:
-  # input_dim will be set automatically = 2 (returns + vol) + len(macro_features)
+  # input_dim is computed automatically as 2 + len(macro_features) = 15
   observable_dim: 128
   encoder_hidden: [256, 256, 128]
   encoder_activation: "relu"
