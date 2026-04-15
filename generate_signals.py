@@ -1,208 +1,228 @@
 """
-Daily signal generation for Koopman-Spectral engine.
-Handles wide-format master.parquet.
-Saves locally only - HF upload handled by workflow.
+Signal generation for Koopman-Spectral engine.
+Loads trained model and produces JSON output with top ETF picks.
 """
 
-import pandas as pd
+import torch
 import numpy as np
-import yaml
+import pandas as pd
 import json
-from datetime import datetime, timedelta
 from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional
+import yaml
 
-from data_loader import load_config, HFDataLoader
+from data_loader import HFDataLoader, load_config
+from koopman_model import KoopmanSpectral
 
 
-class NYSECalendar:
-    """NYSE trading calendar for next valid trading date."""
+def load_trained_model(config, model_path: str = "koopman_spectral_best.pt") -> Optional[KoopmanSpectral]:
+    """Load the trained Koopman model from checkpoint."""
+    if not Path(model_path).exists():
+        print(f"Model checkpoint not found: {model_path}")
+        return None
     
-    HOLIDAYS_2026 = [
-        "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
-        "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
-        "2026-11-26", "2026-12-25",
-    ]
+    checkpoint = torch.load(model_path, map_location='cpu')
+    model = KoopmanSpectral(config)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    return model
+
+
+def compute_predictability_index(eigenvalues: torch.Tensor) -> float:
+    """
+    Compute predictability index from Koopman eigenvalues.
+    Higher when eigenvalues are clustered near unit circle (oscillatory/stable).
+    """
+    mags = torch.abs(eigenvalues)
+    # Predictability = 1 - variance of log magnitudes (normalized)
+    log_mags = torch.log(mags + 1e-8)
+    variance = torch.var(log_mags)
+    predictability = 1.0 / (1.0 + variance)  # Inversely related to variance
+    return float(predictability)
+
+
+def classify_regime(eigenvalues: torch.Tensor) -> str:
+    """Classify market regime based on dominant eigenvalues."""
+    mags = torch.abs(eigenvalues)
+    growth_ratio = (mags > 1.05).float().mean().item()
+    decay_ratio = (mags < 0.95).float().mean().item()
     
-    @classmethod
-    def get_next_trading_date(cls, from_date=None):
-        if from_date is None:
-            from_date = datetime.now()
-        next_date = from_date + timedelta(days=1)
-        while True:
-            if next_date.weekday() >= 5:
-                next_date += timedelta(days=1)
-                continue
-            if next_date.strftime("%Y-%m-%d") in cls.HOLIDAYS_2026:
-                next_date += timedelta(days=1)
-                continue
-            return next_date
-    
-    @classmethod
-    def format_trading_date(cls, dt):
-        return dt.strftime("%A, %B %d, %Y")
+    if growth_ratio > 0.2:
+        return "expansion"
+    elif decay_ratio > 0.3:
+        return "contraction"
+    else:
+        return "oscillatory"
 
 
-def to_python_type(obj):
-    """Convert numpy types to Python native types."""
-    if isinstance(obj, (np.bool_, bool)):
-        return bool(obj)
-    elif isinstance(obj, (np.integer, int)):
-        return int(obj)
-    elif isinstance(obj, (np.floating, float)):
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, dict):
-        return {k: to_python_type(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [to_python_type(i) for i in obj]
-    return obj
-
-
-def generate_signals_simple(config):
-    """Generate signals using simple momentum."""
-    etfs = config['data']['etf_universe']
+def generate_signals(config) -> Dict:
+    """
+    Generate trading signals using trained Koopman model.
+    Returns dict in the format expected by the Streamlit app.
+    """
     lookback = config['data']['lookback_window']
+    target_horizon = config['data'].get('target_horizon', 5)
+    etf_universe = config['data']['etf_universe']
     
+    # Load data
     loader = HFDataLoader(
         use_local=True,
         local_path=config['data'].get('local_path', 'data/p2-etf-deepm-data')
     )
+    master = loader.load_master()
+    if master.empty:
+        raise ValueError("Could not load master.parquet")
     
-    available_etfs = loader.get_all_etfs()
-    print(f"Available ETFs: {available_etfs[:10]}...")
+    # Load trained model
+    model = load_trained_model(config)
+    if model is None:
+        raise RuntimeError("Trained model not found. Run train.py first.")
     
-    signals = []
+    predictions = []
     
-    for etf in etfs:
-        if etf not in available_etfs:
-            print(f"Skipping {etf} - not in dataset")
+    for etf in etf_universe:
+        # Get full historical data for this ETF
+        df = loader.get_etf_data(etf)
+        if df is None or len(df) < lookback + 1:
             continue
         
-        df = loader.get_etf_data(etf, lookback=lookback)
-        if df is None or len(df) < lookback * 0.8:
-            continue
-        
-        # Get returns
-        returns = None
+        # Use log returns
         if 'log_returns' in df.columns:
-            returns = df['log_returns'].dropna()
+            returns = df['log_returns'].values
         elif 'returns' in df.columns:
-            returns = df['returns'].dropna()
-        
-        if returns is None or len(returns) < 20:
+            returns = df['returns'].values
+        else:
             continue
         
-        momentum = float(returns.mean())
-        volatility = float(returns.std())
+        # Compute volatility
+        vol = pd.Series(returns).rolling(5).std().values
         
-        predictability = min(0.95, max(0.3, 1.0 / (1.0 + volatility * 100)))
-        predicted_1d = momentum * 10000
+        # Align and remove NaNs
+        valid = ~(np.isnan(returns) | np.isnan(vol))
+        returns = returns[valid]
+        vol = vol[valid]
+        if len(returns) < lookback + 1:
+            continue
         
-        # Determine regime
-        if momentum > 0.001:
-            regime = "expansion"
-        elif momentum < -0.001:
-            regime = "contraction"
-        else:
-            regime = "oscillatory"
+        # Take most recent lookback window
+        X_seq = np.column_stack([
+            returns[-lookback:],
+            vol[-lookback:]
+        ])  # shape [lookback, 2]
+        X_tensor = torch.tensor(X_seq, dtype=torch.float32).unsqueeze(0)  # [1, lookback, 2]
         
-        signals.append({
-            'etf': str(etf),
-            'predicted_1d_return': float(predicted_1d),
-            'predictability_index': float(predictability),
-            'is_predictable': bool(predictability > 0.6),
-            'koopman_regime': str(regime),
-            'momentum': float(momentum),
-            'volatility': float(volatility)
+        # Predict next return
+        with torch.no_grad():
+            # Encode last observable
+            last_obs = X_tensor[0, -1, :]  # [2]
+            z_last = model.encoder(last_obs.unsqueeze(0))  # [1, obs_dim]
+            pred_return = model(z_last).item()  # scalar (bps? convert)
+        
+        # Convert to basis points (percentage * 100)
+        pred_return_bps = pred_return * 10000  # Assuming log return ~0.0001 per 1bp
+        
+        # Compute predictability from model eigenvalues
+        with torch.no_grad():
+            eigs = torch.linalg.eigvals(model.K)
+            predictability = compute_predictability_index(eigs)
+            regime = classify_regime(eigs)
+        
+        predictions.append({
+            'etf': etf,
+            'predicted_1d_return_bps': pred_return_bps,
+            'predictability_index': predictability,
+            'regime': regime
         })
     
-    if not signals:
-        raise ValueError("No signals generated")
+    # Filter by predictability threshold and sort by predicted return
+    threshold = config['signals']['predictability_threshold']
+    filtered = [p for p in predictions if p['predictability_index'] >= threshold]
+    filtered.sort(key=lambda x: x['predicted_1d_return_bps'], reverse=True)
     
-    # Sort by predicted return
-    signals_sorted = sorted(signals, key=lambda x: x['predicted_1d_return'], reverse=True)
+    # Take top 3
+    top3 = filtered[:3]
+    if len(top3) == 0:
+        # Fallback: use top 3 regardless of predictability
+        predictions.sort(key=lambda x: x['predicted_1d_return_bps'], reverse=True)
+        top3 = predictions[:3]
     
-    # Get top 3
-    top3 = signals_sorted[:3]
-    primary = top3[0]
-    runners = top3[1:3] if len(top3) > 1 else []
-    
-    next_trading = NYSECalendar.get_next_trading_date()
-    
-    # Build result with explicit type conversion
-    result = {
-        'engine': 'KOOPMAN-SPECTRAL',
-        'version': '1.0.0',
-        'timestamp': datetime.now().isoformat(),
-        'signal_date': str(next_trading.strftime('%Y-%m-%d')),
-        'target_date': 'Next NYSE Open: ' + NYSECalendar.format_trading_date(next_trading),
-        'objective': 'MAXIMUM PREDICTED RETURN',
-        'data_source': 'HF: P2SAMAPA/p2-etf-deepm-data/data/master.parquet',
-        'results_repo': 'HF: P2SAMAPA/p2-etf-koopman-spectral-results',
-        'primary_pick': {
-            'etf': str(primary['etf']),
-            'rank': int(1),
-            'predicted_1d_return_bps': round(float(primary['predicted_1d_return']), 1),
-            'predicted_1d_return_pct': round(float(primary['predicted_1d_return']) / 100, 3),
-            'predictability_index': round(float(primary['predictability_index']), 3),
-            'regime': str(primary['koopman_regime']),
-            'conviction_derived': round(float(primary['predictability_index']) * 100, 1)
+    # Build output structure
+    signals = {
+        "engine": "KOOPMAN-SPECTRAL",
+        "version": "1.0.0",
+        "timestamp": datetime.now().isoformat(),
+        "signal_date": datetime.now().strftime("%Y-%m-%d"),
+        "target_date": "Next NYSE Open",
+        "objective": "MAXIMUM PREDICTED RETURN",
+        "data_source": "HF: P2SAMAPA/p2-etf-deepm-data/data/master.parquet",
+        "results_repo": "HF: P2SAMAPA/p2-etf-koopman-spectral-results",
+        "primary_pick": {
+            "etf": top3[0]['etf'],
+            "rank": 1,
+            "predicted_1d_return_bps": round(top3[0]['predicted_1d_return_bps'], 1),
+            "predicted_1d_return_pct": round(top3[0]['predicted_1d_return_bps'] / 100, 3),
+            "predictability_index": round(top3[0]['predictability_index'], 3),
+            "regime": top3[0]['regime']
         },
-        'runner_up_picks': [
+        "runner_up_picks": [
             {
-                'rank': int(i + 2),
-                'etf': str(r['etf']),
-                'predicted_1d_return_bps': round(float(r['predicted_1d_return']), 1),
-                'predicted_1d_return_pct': round(float(r['predicted_1d_return']) / 100, 3),
-                'predictability_index': round(float(r['predictability_index']), 3),
-                'regime': str(r['koopman_regime'])
+                "rank": i+2,
+                "etf": p['etf'],
+                "predicted_1d_return_bps": round(p['predicted_1d_return_bps'], 1),
+                "predicted_1d_return_pct": round(p['predicted_1d_return_bps'] / 100, 3),
+                "predictability_index": round(p['predictability_index'], 3),
+                "regime": p['regime']
             }
-            for i, r in enumerate(runners)
+            for i, p in enumerate(top3[1:3])
         ],
-        'koopman_modes': {
-            'regime': str(primary['koopman_regime']),
-            'predictability_index': round(float(primary['predictability_index']), 3),
-            'growth_modes': int(2 if primary['koopman_regime'] == 'expansion' else 0),
-            'oscillatory_modes': int(3 if primary['koopman_regime'] == 'oscillatory' else 1),
-            'decay_modes': int(60 if primary['koopman_regime'] == 'contraction' else 61)
+        "koopman_modes": {
+            "regime": top3[0]['regime'],
+            "predictability_index": round(top3[0]['predictability_index'], 3),
+            "growth_modes": 0,  # Would need mode classification from eigenvalues
+            "oscillatory_modes": 0,
+            "decay_modes": 0,
+            "dominant_frequency_cycles": 0.0
         },
-        'all_etfs': to_python_type(signals_sorted),
-        'metadata': {
-            'total_etfs_analyzed': int(len(signals)),
-            'predictable_etfs': int(sum(1 for s in signals if s['is_predictable'])),
-            'data_format': 'wide'
+        "all_etfs": predictions,
+        "metadata": {
+            "total_etfs_analyzed": len(predictions),
+            "predictable_etfs": len(filtered),
+            "lookback_window": lookback
         }
     }
     
-    return result
+    return signals
 
 
 def main():
+    print(f"Generating signals at {datetime.now()}")
     config = load_config()
-    print(f"Generating signals...")
     
     try:
-        signals = generate_signals_simple(config)
+        signals = generate_signals(config)
         
-        # Save locally
+        # Save to JSON
         output_dir = Path(config['signals']['output_dir'])
         output_dir.mkdir(exist_ok=True)
-        
-        today = signals['signal_date']
-        output_file = output_dir / f"koopman_signals_{today}.json"
-        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = output_dir / f"koopman_signals_{timestamp}.json"
         with open(output_file, 'w') as f:
             json.dump(signals, f, indent=2)
         
-        print(f"Saved to {output_file}")
-        print(f"\nTop 3 by predicted return:")
-        print(f"  1. {signals['primary_pick']['etf']}: {signals['primary_pick']['predicted_1d_return_bps']:+.1f} bps")
-        for r in signals['runner_up_picks']:
-            print(f"  {r['rank']}. {r['etf']}: {r['predicted_1d_return_bps']:+.1f} bps")
+        # Also save as latest.json
+        latest_file = output_dir / "latest.json"
+        with open(latest_file, 'w') as f:
+            json.dump(signals, f, indent=2)
         
-        print(f"\nSignals ready for upload to HF: P2SAMAPA/p2-etf-koopman-spectral-results")
+        print(f"Signals saved to {output_file}")
+        print(f"Top pick: {signals['primary_pick']['etf']} with {signals['primary_pick']['predicted_1d_return_bps']:.1f} bps")
         
+        # Optionally upload to HuggingFace (if configured)
+        if config.get('github_actions', {}).get('upload_hf', False):
+            from hf_results_uploader import upload_signals
+            upload_signals(output_file)
+            
     except Exception as e:
         print(f"Error: {e}")
         import traceback
