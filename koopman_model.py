@@ -6,207 +6,153 @@ DMD initialization + MLP encoder + learnable linear Koopman operator.
 import torch
 import torch.nn as nn
 import numpy as np
-from scipy.linalg import eig, lstsq
+from scipy.linalg import lstsq
+from typing import Tuple, Dict, Optional
 
 
 class DMDBaseline:
-    """Dynamic Mode Decomposition for initialization."""
+    """Dynamic Mode Decomposition for warm initialization of Koopman operator."""
     
     @staticmethod
-    def fit(X, Y, rank=64):
+    def fit(observables: np.ndarray, observables_next: np.ndarray, rank: int) -> torch.Tensor:
         """
-        X: [N, T, D] — trajectories
-        Y: [N, T, D] — advanced trajectories (X shifted)
-        Returns: Koopman matrix K [rank, rank], encoder/decoder approximations
-        """
-        # Flatten time: treat each timestep as sample
-        X_flat = X.reshape(-1, X.shape[-1])  # [N*T, D]
-        Y_flat = Y.reshape(-1, Y.shape[-1])
+        Compute DMD matrix K such that observables_next ≈ observables @ K.T
         
-        # SVD for rank reduction
-        U, s, Vh = np.linalg.svd(X_flat.T, full_matrices=False)
+        Args:
+            observables: [N, K]  (N samples, K observables)
+            observables_next: [N, K]
+            rank: truncation rank
+        
+        Returns:
+            K: [rank, rank] torch float tensor
+        """
+        # SVD of observables
+        U, s, Vh = np.linalg.svd(observables, full_matrices=False)
         U_r = U[:, :rank]
+        s_r = s[:rank]
         
-        # Project to rank-dim space
-        X_proj = X_flat @ U_r  # [N*T, rank]
-        Y_proj = Y_flat @ U_r
+        # Project to rank-r space
+        observables_proj = observables @ U_r  # [N, rank]
+        observables_next_proj = observables_next @ U_r
         
-        # Least squares for K: Y_proj ≈ X_proj @ K.T
-        K, _, _, _ = lstsq(X_proj, Y_proj)
-        K = K.T  # [rank, rank]
+        # Least squares for K_proj: observables_next_proj ≈ observables_proj @ K_proj.T
+        K_proj, _, _, _ = lstsq(observables_proj, observables_next_proj)
+        K_proj = K_proj.T  # [rank, rank]
         
-        return torch.FloatTensor(K), torch.FloatTensor(U_r)
+        # Transform back to original basis if needed? Not necessary; we'll use K_proj directly.
+        return torch.tensor(K_proj, dtype=torch.float32)
 
 
 class MLPEncoder(nn.Module):
-    """MLP to Koopman observables."""
+    """MLP that maps raw features to Koopman observables."""
     
-    def __init__(self, input_dim, observable_dim, hidden_dims, activation='relu'):
+    def __init__(self, input_dim: int, observable_dim: int, hidden_dims: list, dropout: float = 0.1):
         super().__init__()
-        self.input_dim = input_dim
-        
         layers = []
-        prev_dim = input_dim
-        act = nn.ReLU() if activation == 'relu' else nn.Tanh()
-        
-        for h_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, h_dim),
-                nn.LayerNorm(h_dim),
-                act,
-                nn.Dropout(0.1)
-            ])
-            prev_dim = h_dim
-        
-        layers.append(nn.Linear(prev_dim, observable_dim))
+        prev = input_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(prev, h))
+            layers.append(nn.LayerNorm(h))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev = h
+        layers.append(nn.Linear(prev, observable_dim))
         self.net = nn.Sequential(*layers)
     
-    def forward(self, x):
-        """
-        x: [batch, time, features] or [batch, features]
-        Returns: [batch, time, observable_dim] or [batch, observable_dim]
-        """
-        if x.ndim == 3:
-            B, T, D = x.shape
-            x = x.reshape(B * T, D)
-            z = self.net(x)
-            return z.reshape(B, T, -1)
-        else:
-            return self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [batch, features] -> [batch, observable_dim]"""
+        return self.net(x)
 
 
 class KoopmanSpectral(nn.Module):
     """
-    Full Koopman model with learnable linear dynamics.
+    Koopman autoencoder with learnable linear dynamics and spectral analysis.
     """
     
-    def __init__(self, config):
+    def __init__(self, config: dict):
         super().__init__()
         
-        self.observable_dim = config['model']['observable_dim']
-        input_features = len(config['data']['macro_features']) + 3  # returns, lag, vol
+        self.obs_dim = config['model']['observable_dim']
+        # Input dimension: number of features per timestep (e.g., returns + volatility)
+        # This should be set in config or inferred from data. We'll read from config.
+        self.input_dim = config['model'].get('input_dim', 2)  # default: returns and vol
+        hidden_dims = config['model']['encoder_hidden']
+        dropout = config['model'].get('dropout', 0.1)
         
-        self.encoder = MLPEncoder(
-            input_dim=input_features,
-            observable_dim=self.observable_dim,
-            hidden_dims=config['model']['encoder_hidden'],
-            activation=config['model']['encoder_activation']
-        )
+        self.encoder = MLPEncoder(self.input_dim, self.obs_dim, hidden_dims, dropout)
         
-        # Learnable Koopman operator (initialized via DMD)
-        self.K = nn.Parameter(torch.randn(self.observable_dim, self.observable_dim) * 0.01)
+        # Learnable Koopman operator (will be initialized via DMD)
+        self.K = nn.Parameter(torch.eye(self.obs_dim) * 0.01)
         
-        # Readout head: observables → return prediction
+        # Readout: observables -> 1-day return prediction
         self.readout = nn.Sequential(
-            nn.Linear(self.observable_dim, 32),
+            nn.Linear(self.obs_dim, 32),
             nn.ReLU(),
-            nn.Linear(32, 1)  # Predict next-day return
+            nn.Dropout(dropout),
+            nn.Linear(32, 1)
         )
-        
-        # Eigenvalue buffer (computed after forward)
-        self.register_buffer('eigenvalues', torch.zeros(self.observable_dim, dtype=torch.complex64))
     
-    def initialize_with_dmd(self, dmd_K):
-        """Warm start from DMD solution."""
+    def initialize_with_dmd(self, dmd_K: torch.Tensor):
+        """Warm start the Koopman matrix from DMD solution."""
         with torch.no_grad():
-            self.K.copy_(dmd_K)
+            # Ensure dimensions match
+            if dmd_K.shape != self.K.shape:
+                # Pad or truncate
+                min_rows = min(dmd_K.shape[0], self.K.shape[0])
+                min_cols = min(dmd_K.shape[1], self.K.shape[1])
+                self.K[:min_rows, :min_cols] = dmd_K[:min_rows, :min_cols]
+            else:
+                self.K.copy_(dmd_K)
     
-    def forward(self, X, return_modes=False):
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
-        X: [batch, time, features] — input trajectory
-        Returns: predictions + optional Koopman modes
+        Predict next return from current observable.
+        z: [batch, obs_dim]
+        Returns: next_return [batch, 1]
         """
-        batch_size, T, _ = X.shape
-        
-        # Encode to observable space
-        Z = self.encoder(X)  # [batch, time, K]
-        
-        # Apply Koopman operator: linear dynamics in latent space
-        # Z_next = Z @ K.T
-        Z_last = Z[:, -1, :]  # [batch, K] — final observable state
-        
-        # Multi-step prediction via Koopman operator power
-        Z_future = []
-        Z_current = Z_last
-        for _ in range(5):  # Predict 5 days ahead
-            Z_current = Z_current @ self.K.T  # Linear evolution
-            Z_future.append(Z_current)
-        
-        Z_future = torch.stack(Z_future, dim=1)  # [batch, 5, K]
-        
-        # Decode to returns
-        returns_pred = self.readout(Z_future.reshape(-1, self.observable_dim))
-        returns_pred = returns_pred.reshape(batch_size, 5)
-        
-        if return_modes:
-            # Compute eigen-decomposition for interpretability
-            with torch.no_grad():
-                eigs, _ = torch.linalg.eig(self.K)
-                self.eigenvalues = eigs
-            
-            # Classify modes
-            modes = self._classify_modes(eigs)
-            return returns_pred, modes, Z_future
-        
-        return returns_pred
+        # Linear dynamics: z_next = z @ K.T
+        z_next = z @ self.K.T
+        r_next = self.readout(z_next)
+        return r_next
     
-    def _classify_modes(self, eigenvalues):
+    def compute_koopman_loss(self, X: torch.Tensor, y: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Classify Koopman eigenvalues:
-        - Growth: |λ| > 1 (unstable/expanding)
-        - Oscillatory: Im(λ) ≠ 0 (rotating)
-        - Decay: |λ| < 1 (stable/contracting)
+        Compute combined loss: prediction MSE + linearity constraint + spectral penalty.
+        X: [batch, lookback, features]
+        y: [batch, target_horizon] (returns)
         """
-        magnitudes = torch.abs(eigenvalues)
-        angles = torch.angle(eigenvalues)
+        # Encode all timesteps
+        batch_size, T, D = X.shape
+        flat = X.view(-1, D)
+        z_all = self.encoder(flat).view(batch_size, T, -1)  # [batch, T, obs_dim]
         
-        growth_mask = magnitudes > 1.05
-        decay_mask = magnitudes < 0.95
-        osc_mask = torch.abs(angles) > 0.1
+        # Linearity loss: z[t+1] ≈ z[t] @ K.T
+        z_in = z_all[:, :-1, :].reshape(-1, self.obs_dim)
+        z_out = z_all[:, 1:, :].reshape(-1, self.obs_dim)
+        z_pred = z_in @ self.K.T
+        linearity_loss = nn.MSELoss()(z_pred, z_out)
         
-        return {
-            'eigenvalues': eigenvalues,
-            'magnitudes': magnitudes,
-            'frequencies': angles / (2 * np.pi),  # Cycles per step
-            'growth_count': growth_mask.sum().item(),
-            'oscillatory_count': (osc_mask & ~growth_mask & ~decay_mask).sum().item(),
-            'decay_count': decay_mask.sum().item(),
-            'spectral_gap': (magnitudes.max() - magnitudes[magnitudes < 1].max()).item() if (magnitudes < 1).any() else 0.0
-        }
-    
-    def koopman_loss(self, X, Y_true, config):
-        """
-        Combined loss: prediction + linearity + spectral penalty
-        """
-        # Encode full trajectory
-        Z = self.encoder(X)  # [batch, time, K]
+        # Prediction loss: from last observable to next return
+        z_last = z_all[:, -1, :]
+        pred_returns = self.forward(z_last)  # [batch, 1]
+        target = y[:, 0:1]  # next day return
+        pred_loss = nn.MSELoss()(pred_returns, target)
         
-        # Linearity: Z[t+1] ≈ Z[t] @ K.T
-        Z_in = Z[:, :-1, :].reshape(-1, self.observable_dim)  # All but last
-        Z_out = Z[:, 1:, :].reshape(-1, self.observable_dim)   # All but first
-        
-        Z_pred = Z_in @ self.K.T
-        linearity_loss = nn.MSELoss()(Z_pred, Z_out)
-        
-        # Prediction loss on returns
-        returns_pred = self.forward(X)
-        Y_returns = Y_true[:, :, 0]  # First feature is returns
-        pred_loss = nn.MSELoss()(returns_pred, Y_returns)
-        
-        # Spectral penalty: encourage stable eigenvalues (|λ| < 1.2)
+        # Spectral penalty: encourage eigenvalues within unit circle
         with torch.no_grad():
             eigs = torch.linalg.eigvals(self.K)
             max_mag = torch.abs(eigs).max()
-        
         spectral_penalty = torch.relu(max_mag - 1.2) ** 2
         
-        total_loss = (config['model']['prediction_weight'] * pred_loss + 
-                    config['model']['linearity_weight'] * linearity_loss +
-                    config['model']['spectral_weight'] * spectral_penalty)
+        # Weighted sum
+        total_loss = (config['model']['prediction_weight'] * pred_loss +
+                      config['model']['linearity_weight'] * linearity_loss +
+                      config['model']['spectral_weight'] * spectral_penalty)
         
-        return total_loss, {
-            'pred_loss': pred_loss.item(),
-            'linearity_loss': linearity_loss.item(),
-            'spectral_penalty': spectral_penalty.item(),
-            'max_eig_magnitude': max_mag.item()
+        return {
+            'loss': total_loss,
+            'pred_loss': pred_loss,
+            'linearity_loss': linearity_loss,
+            'spectral_penalty': spectral_penalty,
+            'max_eig_magnitude': max_mag
         }
