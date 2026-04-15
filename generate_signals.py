@@ -1,5 +1,5 @@
 """
-Signal generation using trained Koopman model with GRU encoder.
+Signal generation using trained Koopman model with LSTM sequence encoder.
 """
 
 import torch
@@ -24,29 +24,49 @@ def load_trained_model(config, model_path: str = "koopman_spectral_best.pt") -> 
     model = KoopmanSpectral(config)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
-    scale_factor = checkpoint.get('scale_factor', 100.0)
-    return model, scale_factor
+    return model
 
 
 def compute_predictability_index(eigenvalues: torch.Tensor) -> float:
-    # Placeholder – not used in GRU variant, kept for compatibility
-    return 0.6
+    mags = torch.abs(eigenvalues)
+    log_mags = torch.log(mags + 1e-8)
+    variance = torch.var(log_mags)
+    return float(1.0 / (1.0 + variance))
 
 
 def classify_regime(eigenvalues: torch.Tensor) -> str:
-    return "oscillatory"
+    mags = torch.abs(eigenvalues)
+    growth_ratio = (mags > 1.05).float().mean().item()
+    decay_ratio = (mags < 0.95).float().mean().item()
+    if growth_ratio > 0.2:
+        return "expansion"
+    elif decay_ratio > 0.3:
+        return "contraction"
+    else:
+        return "oscillatory"
 
 
-def get_latest_macro_values(loader: HFDataLoader, macro_cols: List[str]) -> Dict[str, float]:
+def get_latest_macro_history(loader: HFDataLoader, macro_cols: List[str], lookback: int) -> np.ndarray:
+    """
+    Retrieve the most recent lookback days of macro data.
+    Returns array of shape [lookback, len(macro_cols)].
+    """
     macro_df = loader.get_macro_data(macro_cols)
-    if macro_df.empty:
-        return {col: 0.0 for col in macro_cols}
-    latest = macro_df.iloc[-1]
-    return {col: latest[col] for col in macro_cols if col in latest}
+    if macro_df.empty or len(macro_df) < lookback:
+        # Return zeros
+        return np.zeros((lookback, len(macro_cols)))
+    # Take last lookback rows
+    recent = macro_df.iloc[-lookback:][macro_cols].values
+    if len(recent) < lookback:
+        # Pad with zeros at the beginning
+        pad = np.zeros((lookback - len(recent), len(macro_cols)))
+        recent = np.vstack([pad, recent])
+    return recent
 
 
 def generate_signals(config) -> Dict:
     lookback = config['data']['lookback_window']
+    target_horizon = config['data'].get('target_horizon', 5)
     etf_universe = config['data']['etf_universe']
     macro_cols = config['data']['macro_features']
     
@@ -58,16 +78,17 @@ def generate_signals(config) -> Dict:
     if master.empty:
         raise ValueError("Could not load master.parquet")
     
-    model, scale_factor = load_trained_model(config)
+    model = load_trained_model(config)
     if model is None:
         raise RuntimeError("Trained model not found.")
     
-    current_macro = get_latest_macro_values(loader, macro_cols)
+    # Get most recent macro history (same for all ETFs)
+    macro_history = get_latest_macro_history(loader, macro_cols, lookback)
     
     predictions = []
     
     for etf in etf_universe:
-        df = loader.get_etf_data(etf, lookback=None)
+        df = loader.get_etf_data(etf, lookback=None)  # full history
         if df is None or len(df) < lookback + 1:
             continue
         
@@ -85,23 +106,24 @@ def generate_signals(config) -> Dict:
         if len(returns) < lookback:
             continue
         
-        # Most recent lookback window
+        # Use most recent lookback window for returns and vol
         ret_window = returns[-lookback:].reshape(-1, 1)
         vol_window = vol[-lookback:].reshape(-1, 1)
-        macro_history = np.tile([current_macro.get(c, 0.0) for c in macro_cols], (lookback, 1))
-        X_seq = np.hstack([ret_window, vol_window, macro_history])
-        X_tensor = torch.tensor(X_seq, dtype=torch.float32).unsqueeze(0)
+        
+        # Combine with macro history (same for all ETFs, but could also use ETF-specific macro if available)
+        X_seq = np.hstack([ret_window, vol_window, macro_history])  # [lookback, 2+M]
+        X_tensor = torch.tensor(X_seq, dtype=torch.float32).unsqueeze(0)  # [1, lookback, features]
         
         with torch.no_grad():
-            pred_scaled = model(X_tensor).item()  # scaled prediction
-            # Unscale
-            pred_return = pred_scaled / scale_factor
+            pred_return = model(X_tensor).item()
         
         pred_return_bps = pred_return * 10000
         
-        # Use placeholder predictability (global value)
-        predictability = 0.6
-        regime = "oscillatory"
+        # Global predictability from model eigenvalues
+        with torch.no_grad():
+            eigs = torch.linalg.eigvals(model.K)
+            predictability = compute_predictability_index(eigs)
+            regime = classify_regime(eigs)
         
         predictions.append({
             'etf': etf,
@@ -121,7 +143,7 @@ def generate_signals(config) -> Dict:
     
     signals = {
         "engine": "KOOPMAN-SPECTRAL",
-        "version": "2.0.0-GRU",
+        "version": "1.0.0",
         "timestamp": datetime.now().isoformat(),
         "signal_date": datetime.now().strftime("%Y-%m-%d"),
         "target_date": "Next NYSE Open",
@@ -148,8 +170,8 @@ def generate_signals(config) -> Dict:
             for i, p in enumerate(top3[1:3])
         ],
         "koopman_modes": {
-            "regime": "oscillatory",
-            "predictability_index": 0.6,
+            "regime": top3[0]['koopman_regime'],
+            "predictability_index": round(top3[0]['predictability_index'], 3),
             "growth_modes": 0,
             "oscillatory_modes": 0,
             "decay_modes": 0,
@@ -159,8 +181,7 @@ def generate_signals(config) -> Dict:
         "metadata": {
             "total_etfs_analyzed": len(predictions),
             "predictable_etfs": len(filtered),
-            "lookback_window": lookback,
-            "model_type": "GRU-sequence-encoder"
+            "lookback_window": lookback
         }
     }
     return signals
