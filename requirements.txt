@@ -8,3 +8,4 @@ streamlit>=1.30.0
 plotly>=5.18.0
 requests>=2.31.0
 huggingface-hub>=0.20.0  # For HF dataset upload/download
+sklearn
