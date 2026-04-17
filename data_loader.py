@@ -7,7 +7,8 @@ Fixes vs original:
      (was a shared pre-computed block — the main cause of identical predictions).
   2. StandardScaler fit on training data, saved/loaded alongside checkpoint.
   3. Returns etf_to_idx and idx_tensor for ETF embedding table.
-  4. SPY excluded from training universe (benchmark only).
+  4. max_samples parameter caps memory usage for GitHub Actions CI.
+  5. SPY excluded from training universe (benchmark only).
 """
 
 import pandas as pd
@@ -32,19 +33,17 @@ class HFDataLoader:
 
     def __init__(self, use_local: bool = True,
                  local_path: str = "data/p2-etf-deepm-data"):
-        self.use_local   = use_local
-        self.local_path  = Path(local_path)
-        self._master_df  = None
-        self._columns    = None
+        self.use_local        = use_local
+        self.local_path       = Path(local_path)
+        self._master_df       = None
+        self._columns         = None
         self._etf_columns_map = None
-        self._date_col   = None
-
-    # ---- internal loaders ------------------------------------------------
+        self._date_col        = None
 
     def _load_master_from_hf(self) -> pd.DataFrame:
         url = f"{self.BASE_URL}/master.parquet"
         try:
-            r = requests.get(url, timeout=60)
+            r = requests.get(url, timeout=120)
             r.raise_for_status()
             df = pd.read_parquet(BytesIO(r.content))
             self._process_columns(df)
@@ -67,17 +66,18 @@ class HFDataLoader:
 
     def _process_columns(self, df: pd.DataFrame):
         self._columns = df.columns.tolist()
-        date_cols = [c for c in self._columns if c.lower() in ('date', 'timestamp', 'time')]
+        date_cols = [c for c in self._columns
+                     if c.lower() in ('date', 'timestamp', 'time')]
         self._date_col = date_cols[0] if date_cols else self._columns[0]
         self._etf_columns_map = {}
-        pat = re.compile(r'^(.*?)(?:_Open|_High|_Low|_Close|_Volume|_AdjClose|_Returns|_LogReturns)$')
+        pat = re.compile(
+            r'^(.*?)(?:_Open|_High|_Low|_Close|_Volume|_AdjClose|_Returns|_LogReturns)$'
+        )
         for col in self._columns:
             m = pat.match(col)
             if m:
                 self._etf_columns_map.setdefault(m.group(1), []).append(col)
-        print(f"Detected {len(self._etf_columns_map)} ETFs")
-
-    # ---- public API -------------------------------------------------------
+        print(f"Detected {len(self._etf_columns_map)} ETFs in master.parquet")
 
     def load_master(self) -> pd.DataFrame:
         if self._master_df is not None:
@@ -125,7 +125,6 @@ class HFDataLoader:
 
         df['symbol'] = symbol
         df = df.sort_values('date').dropna(subset=['log_returns']).reset_index(drop=True)
-
         if lookback and len(df) > lookback:
             return df.iloc[-lookback:]
         return df
@@ -137,10 +136,9 @@ class HFDataLoader:
         available = [c for c in macro_cols if c in master.columns]
         missing   = set(macro_cols) - set(available)
         if missing:
-            print(f"Warning: missing macro columns: {missing}")
+            print(f"Warning: missing macro cols: {missing}")
         if not available:
             return pd.DataFrame()
-
         df = pd.DataFrame({'date': pd.to_datetime(master[self._date_col])})
         for col in available:
             df[col] = master[col].values
@@ -172,39 +170,42 @@ def save_scaler(scaler, path: str = "koopman_scaler.pkl"):
 def load_scaler(path: str = "koopman_scaler.pkl"):
     p = Path(path)
     if not p.exists():
-        print(f"No scaler found at {path} — skipping normalisation.")
+        print(f"No scaler at {path} — skipping normalisation.")
         return None
     with open(path, "rb") as f:
         return pickle.load(f)
 
 
 def apply_scaler(X_np: np.ndarray, scaler) -> np.ndarray:
-    """X_np: [..., lookback, features] — scaler was fit on [N*lookback, features]."""
     if scaler is None:
         return X_np
     shape = X_np.shape
-    flat  = X_np.reshape(-1, shape[-1])
-    return scaler.transform(flat).reshape(shape)
+    return scaler.transform(X_np.reshape(-1, shape[-1])).reshape(shape)
 
 
 # ---------------------------------------------------------------------------
 # Dataset builder
 # ---------------------------------------------------------------------------
 
-def build_dataset_tensors(config, split: str = 'train',
-                          scaler=None, fit_scaler: bool = False):
+def build_dataset_tensors(
+    config,
+    split: str = 'train',
+    scaler=None,
+    fit_scaler: bool = False,
+    max_samples: int = 500_000,
+):
     """
     Returns: X_tensor, y_tensor, idx_tensor, feature_names, etf_to_idx, scaler
 
-    Key fix: macro data is now merged with each ETF's own date index
-    instead of using a single shared macro block for all tickers.
+    max_samples: hard cap on number of training windows to avoid OOM on CI.
+    Macro data is merged per-ETF by date (fixes the shared-block bug).
     """
     import torch
-    from sklearn.preprocessing import StandardScaler as SK_StandardScaler
+    from sklearn.preprocessing import StandardScaler as SK_Scaler
 
     lookback       = config['data']['lookback_window']
     target_horizon = config['data'].get('target_horizon', 5)
-    etf_universe   = config['data']['etf_universe']   # SPY already removed in config
+    etf_universe   = config['data']['etf_universe']   # SPY already excluded
     macro_cols     = config['data']['macro_features']
 
     loader = HFDataLoader(
@@ -217,7 +218,6 @@ def build_dataset_tensors(config, split: str = 'train',
 
     etf_to_idx = {etf: i for i, etf in enumerate(etf_universe)}
 
-    # Load full macro series — we merge per-ETF by date below
     macro_df = loader.get_macro_data(macro_cols)
     if macro_df.empty:
         macro_df = pd.DataFrame({'date': pd.to_datetime(master[loader._date_col])})
@@ -227,6 +227,10 @@ def build_dataset_tensors(config, split: str = 'train',
     all_X, all_y, all_idx = [], [], []
 
     for etf in etf_universe:
+        if len(all_X) >= max_samples:
+            print(f"max_samples={max_samples:,} reached — stopping early.")
+            break
+
         df = loader.get_etf_data(etf, lookback=None)
         if df is None or len(df) < lookback + target_horizon:
             continue
@@ -241,7 +245,7 @@ def build_dataset_tensors(config, split: str = 'train',
         if len(returns) < lookback + target_horizon:
             continue
 
-        # FIX: align macro by this ETF's own dates
+        # FIX: align macro by this ETF's own dates, not a shared array
         merged = pd.DataFrame({'date': pd.to_datetime(dates),
                                 'returns': returns, 'vol': vol})
         merged = merged.merge(macro_df, on='date', how='left')
@@ -251,14 +255,16 @@ def build_dataset_tensors(config, split: str = 'train',
             else:
                 merged[col] = 0.0
 
-        ret_arr   = merged['returns'].values
-        vol_arr   = merged['vol'].values
-        mac_arr   = merged[macro_cols].values
-        etf_i     = etf_to_idx[etf]
+        ret_arr = merged['returns'].values
+        vol_arr = merged['vol'].values
+        mac_arr = merged[macro_cols].values
+        etf_i   = etf_to_idx[etf]
 
         for i in range(len(ret_arr) - lookback - target_horizon + 1):
-            X_seq = np.hstack([ret_arr[i:i+lookback].reshape(-1,1),
-                               vol_arr[i:i+lookback].reshape(-1,1),
+            if len(all_X) >= max_samples:
+                break
+            X_seq = np.hstack([ret_arr[i:i+lookback].reshape(-1, 1),
+                               vol_arr[i:i+lookback].reshape(-1, 1),
                                mac_arr[i:i+lookback]])
             y_seq = ret_arr[i+lookback: i+lookback+target_horizon]
             if np.isnan(X_seq).any() or np.isnan(y_seq).any():
@@ -267,21 +273,22 @@ def build_dataset_tensors(config, split: str = 'train',
             all_y.append(y_seq)
             all_idx.append(etf_i)
 
+        print(f"  {etf}: {len(all_X):,} samples so far")
+
     if not all_X:
         return None, None, None, None, etf_to_idx, scaler
 
     split_idx = int(len(all_X) * 0.8)
     sl = slice(None, split_idx) if split == 'train' else slice(split_idx, None)
-    X = np.array(all_X[sl])
-    y = np.array(all_y[sl])
-    idx_arr = np.array(all_idx[sl])
+    X       = np.array(all_X)[sl]
+    y       = np.array(all_y)[sl]
+    idx_arr = np.array(all_idx)[sl]
 
-    # FIX: normalise features
     if fit_scaler:
-        scaler = SK_StandardScaler()
+        scaler = SK_Scaler()
         N, L, F = X.shape
         scaler.fit(X.reshape(-1, F))
-        print("StandardScaler fitted on training data.")
+        print(f"StandardScaler fitted on {N*L:,} rows, {F} features.")
 
     X = apply_scaler(X, scaler)
 
@@ -300,11 +307,12 @@ def build_dataset_tensors(config, split: str = 'train',
 if __name__ == "__main__":
     try:
         config = load_config()
-        result = build_dataset_tensors(config, 'train', fit_scaler=True)
+        result = build_dataset_tensors(config, 'train', fit_scaler=True,
+                                       max_samples=10_000)
         X, y, idx, feat_names, etf_to_idx, scaler = result
         if X is not None:
-            print(f"Train samples: {X.shape[0]}, features: {X.shape[-1]}")
-            print(f"ETF universe ({len(etf_to_idx)}): {list(etf_to_idx.keys())}")
+            print(f"\nTrain samples: {X.shape[0]} | shape: {X.shape}")
+            print(f"ETF universe: {list(etf_to_idx.keys())}")
         else:
             print("No data generated.")
     except Exception as e:
