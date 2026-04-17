@@ -1,20 +1,18 @@
 """
-Training script for Koopman-Spectral engine with LSTM sequence encoder.
+Training script for Koopman-Spectral engine.
 
-Fixes applied:
+Fixes vs original:
   1. Passes etf_idx to model so ETF embedding is trained.
-  2. Fits StandardScaler on training set and saves it with the checkpoint.
-  3. Calls dmd_warm_start() when config dmd_init=true.
-  4. Saves num_etfs and etf_to_idx in the checkpoint so generate_signals.py
-     can rebuild the model correctly.
+  2. Fits and saves StandardScaler with the checkpoint.
+  3. Saves etf_to_idx in checkpoint for use at inference.
+  4. Optional DMD warm-start.
+  5. Gradient clipping for LSTM stability.
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-from pathlib import Path
 from datetime import datetime
 
 from data_loader import load_config, build_dataset_tensors, save_scaler
@@ -23,122 +21,101 @@ from koopman_model import KoopmanSpectral
 
 def main():
     print(f"=== Koopman-Spectral Training Started {datetime.now()} ===")
-
     config = load_config()
 
     num_macro = len(config['data']['macro_features'])
     config['model']['input_dim'] = 2 + num_macro
-    print(f"Input dimension: {config['model']['input_dim']} "
-          f"(returns + vol + {num_macro} macro features)")
+    print(f"Input dim: {config['model']['input_dim']} "
+          f"(returns + vol + {num_macro} macro)")
 
-    # ── Load data ──────────────────────────────────────────────────────────
-    # FIX: fit_scaler=True on training set; scaler returned and saved.
-    X_train, y_train, idx_train, feat_names, etf_to_idx, scaler = \
+    # Load & normalise — fit scaler on train only
+    X_tr, y_tr, idx_tr, feat_names, etf_to_idx, scaler = \
         build_dataset_tensors(config, split='train', fit_scaler=True)
 
-    # Validation uses the same scaler (no re-fitting).
-    X_val, y_val, idx_val, _, _, _ = \
-        build_dataset_tensors(config, split='val', scaler=scaler, fit_scaler=False)
+    X_vl, y_vl, idx_vl, _, _, _ = \
+        build_dataset_tensors(config, split='val', scaler=scaler)
 
-    if X_train is None or len(X_train) == 0:
-        print("ERROR: No training data available.")
+    if X_tr is None or len(X_tr) == 0:
+        print("ERROR: No training data.")
         return
 
-    print(f"Train samples: {len(X_train)}, Val samples: {len(X_val)}")
-    print(f"Input features: {feat_names}")
-    print(f"Input shape: {X_train.shape[1:]} (lookback, features)")
-    print(f"ETF universe size: {len(etf_to_idx)}")
+    print(f"Train: {len(X_tr)}  Val: {len(X_vl)}")
+    print(f"Features: {feat_names}")
+    print(f"ETF universe ({len(etf_to_idx)}): {list(etf_to_idx.keys())}")
 
-    # ── Configure model with ETF embedding ────────────────────────────────
+    # Wire ETF count into model config
     config['model']['num_etfs']    = len(etf_to_idx)
     config['model']['etf_emb_dim'] = config['model'].get('etf_emb_dim', 16)
 
-    # ── DataLoaders ────────────────────────────────────────────────────────
     bs = config['training']['batch_size']
-    train_loader = DataLoader(
-        TensorDataset(X_train, y_train, idx_train), batch_size=bs, shuffle=True
-    )
-    val_loader = DataLoader(
-        TensorDataset(X_val, y_val, idx_val), batch_size=bs, shuffle=False
-    )
+    train_loader = DataLoader(TensorDataset(X_tr, y_tr, idx_tr),
+                              batch_size=bs, shuffle=True)
+    val_loader   = DataLoader(TensorDataset(X_vl, y_vl, idx_vl),
+                              batch_size=bs, shuffle=False)
 
     model     = KoopmanSpectral(config)
-    optimizer = optim.Adam(model.parameters(), lr=config['training']['learning_rate'])
+    optimizer = optim.Adam(model.parameters(),
+                           lr=config['training']['learning_rate'])
     criterion = nn.MSELoss()
 
-    # ── Optional DMD warm-start ────────────────────────────────────────────
+    # Optional DMD warm-start
     if config['training'].get('dmd_init', False):
-        print("Running DMD warm-start on training latents …")
+        print("Running DMD warm-start …")
         model.eval()
         latents = []
         with torch.no_grad():
-            for X_batch, _, idx_batch in train_loader:
-                z = model.get_latent(X_batch, etf_idx=idx_batch)
-                latents.append(z)
-        Z = torch.cat(latents, dim=0)
-        model.dmd_warm_start(Z)
+            for Xb, _, ib in train_loader:
+                latents.append(model.get_latent(Xb, etf_idx=ib))
+        model.dmd_warm_start(torch.cat(latents, dim=0))
 
-    # ── Training loop ──────────────────────────────────────────────────────
-    epochs          = config['training']['epochs']
-    patience        = config['training']['patience']
-    best_val_loss   = float('inf')
-    patience_counter = 0
+    epochs, patience = config['training']['epochs'], config['training']['patience']
+    best_val, patience_ctr = float('inf'), 0
 
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
-        for X_batch, y_batch, idx_batch in train_loader:
-            pred   = model(X_batch, etf_idx=idx_batch)   # [batch, 1]
-            target = y_batch[:, 0:1]                      # next-day return
-            loss   = criterion(pred, target)
+        for Xb, yb, ib in train_loader:
+            pred = model(Xb, etf_idx=ib)
+            loss = criterion(pred, yb[:, 0:1])
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            train_loss += loss.item() * X_batch.size(0)
+            train_loss += loss.item() * Xb.size(0)
         train_loss /= len(train_loader.dataset)
 
-        # Validation
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for X_batch, y_batch, idx_batch in val_loader:
-                pred   = model(X_batch, etf_idx=idx_batch)
-                target = y_batch[:, 0:1]
-                val_loss += criterion(pred, target).item() * X_batch.size(0)
+            for Xb, yb, ib in val_loader:
+                val_loss += criterion(model(Xb, etf_idx=ib),
+                                      yb[:, 0:1]).item() * Xb.size(0)
         val_loss /= len(val_loader.dataset)
 
-        if val_loss < best_val_loss:
-            best_val_loss    = val_loss
-            patience_counter = 0
-            torch.save(
-                {
-                    'epoch':             epoch,
-                    'model_state_dict':  model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_loss':          val_loss,
-                    'config':            config,
-                    'etf_to_idx':        etf_to_idx,   # needed at inference
-                    'num_etfs':          len(etf_to_idx),
-                },
-                'koopman_spectral_best.pt',
-            )
+        if val_loss < best_val:
+            best_val, patience_ctr = val_loss, 0
+            torch.save({
+                'epoch':                epoch,
+                'model_state_dict':     model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss':             val_loss,
+                'config':               config,
+                'etf_to_idx':           etf_to_idx,
+                'num_etfs':             len(etf_to_idx),
+            }, 'koopman_spectral_best.pt')
             print(f"Epoch {epoch+1}: new best val_loss={val_loss:.6f}")
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
+            patience_ctr += 1
+            if patience_ctr >= patience:
                 print(f"Early stopping at epoch {epoch+1}")
                 break
 
         if (epoch + 1) % 20 == 0:
             print(f"Epoch {epoch+1}/{epochs} | "
-                  f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+                  f"train={train_loss:.6f} | val={val_loss:.6f}")
 
-    # Save scaler separately so generate_signals.py can load it
     save_scaler(scaler, "koopman_scaler.pkl")
-
-    print(f"=== Training Complete {datetime.now()} ===")
-    print(f"Best val loss: {best_val_loss:.6f}")
+    print(f"=== Training Complete {datetime.now()} | best val={best_val:.6f} ===")
 
 
 if __name__ == "__main__":
