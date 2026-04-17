@@ -1,74 +1,101 @@
-name: Train Koopman-Spectral and Upload to HF
+name: Train and Generate Signals
 
 on:
   schedule:
-    - cron: '0 2 * * 1-5'  # 2 AM UTC, Mon-Fri
-  workflow_dispatch:
+    - cron: '0 2 * * 1-5'   # 2 AM UTC, weekdays only
+  workflow_dispatch:          # allow manual trigger
 
 jobs:
-  train:
+  train-and-signal:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
-    
+    timeout-minutes: 300      # hard 5-hour cap on the whole job
+
+    env:
+      CI: "true"              # train.py reads this to apply memory/epoch caps
+      MAX_SAMPLES: "40000"    # ~2 GB tensor memory on a 7 GB runner
+
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-    
-    - name: Cache pip
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-    
-    - name: Install dependencies
-      run: |
-        pip install --upgrade pip
-        pip install -r requirements.txt
-    
-    - name: Download training data from HF
-      run: |
-        mkdir -p data/p2-etf-deepm-data
-        python << 'EOF'
-        import requests
-        url = 'https://huggingface.co/datasets/P2SAMAPA/p2-etf-deepm-data/resolve/main/data/master.parquet'
-        r = requests.get(url, timeout=120)
-        r.raise_for_status()
-        with open('data/p2-etf-deepm-data/master.parquet', 'wb') as f:
-            f.write(r.content)
-        print(f'Downloaded: {len(r.content)} bytes')
-        EOF
-    
-    - name: Train model
-      run: |
-        echo "Starting training at $(date)"
-        python train.py
-        echo "Training complete at $(date)"
-    
-    - name: Generate signals
-      run: |
-        echo "Generating signals at $(date)"
-        python generate_signals.py
-    
-    - name: Upload results to HF Hub
-      env:
-        HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      run: |
-        if [ -z "$HF_TOKEN" ]; then
-          echo "❌ HF_TOKEN not set. Skipping upload."
-          echo "Please add HF_TOKEN at: https://github.com/${{ github.repository }}/settings/secrets/actions"
-          exit 0
-        fi
-        echo "✓ HF_TOKEN is set, uploading..."
-        python hf_results_uploader.py
-    
-    - name: Summary
-      run: |
-        echo "=== Run Complete ==="
-        ls -la signals/ 2>/dev/null || echo "No signals"
-        if [ -f hf_upload_manifest.json ]; then
-          cat hf_upload_manifest.json
-        fi
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── Cache the parquet data so we don't re-download every run ──────
+      - name: Cache HuggingFace data
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: hf-data-${{ hashFiles('config.yaml') }}-v1
+
+      - name: Download data from HuggingFace
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              repo_id="P2SAMAPA/p2-etf-deepm-data",
+              repo_type="dataset",
+              local_dir="data/p2-etf-deepm-data",
+              ignore_patterns=["*.git*"],
+          )
+          print("Data downloaded.")
+          EOF
+
+      - name: Show data size
+        run: du -sh data/ || echo "data/ not found"
+
+      # ── Cache model checkpoint so re-runs skip full retraining ────────
+      - name: Cache model checkpoint
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: |
+            koopman_spectral_best.pt
+            koopman_scaler.pkl
+          key: model-${{ github.sha }}
+          restore-keys: |
+            model-
+
+      - name: Train model
+        timeout-minutes: 240   # 4 hours for training step alone
+        run: |
+          echo "Starting training at $(date)"
+          python train.py
+          echo "Training finished at $(date)"
+          ls -lh koopman_spectral_best.pt koopman_scaler.pkl || echo "WARNING: checkpoint files missing"
+
+      - name: Generate signals
+        timeout-minutes: 15
+        run: |
+          echo "Generating signals at $(date)"
+          python generate_signals.py
+          echo "Signals generated at $(date)"
+          cat signals/latest.json | python -m json.tool | head -60
+
+      - name: Upload signals to HuggingFace
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python hf_results_uploader.py || echo "Upload step failed — check HF_TOKEN secret"
+
+      - name: Upload checkpoint as artifact (fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-checkpoint-${{ github.run_id }}
+          path: |
+            koopman_spectral_best.pt
+            koopman_scaler.pkl
+            signals/latest.json
+          retention-days: 7
+          if-no-files-found: warn
