@@ -8,7 +8,7 @@ data:
 
   # SPY removed — used as benchmark only, not a pick candidate
   etf_universe: ["QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLRE", "XLB",
-                 "XLP", "XLU", "GDX", "XME", "IWM", "TLT", "LQD", "HYG",
+                 "XLP", "XLU", "GDX", "XME", "IWM", "TLT", "LQD", "HYG", "IWF", "XSD", "XBI", 
                  "VNQ", "GLD", "SLV", "VCIT"]
 
   benchmark: "SPY"
